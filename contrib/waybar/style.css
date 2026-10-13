@@ -1,15 +1,16 @@
 /* Copyright (C) 2026 Adam Quandour
  * SPDX-License-Identifier: GPL-3.0-or-later (see COPYING) */
-/* waybar style for waymacs: black on white, with visible workspace states */
+/* waybar style for waymacs: the colours of Emacs's tsdh-light theme
+ * (the bar is its mode-line), with visible workspace states */
 * { font-family: monospace; font-size: 13px; border: none; border-radius: 0; }
-window#waybar { background: #ffffff; color: #000000; }
-#tags button { padding: 0 6px; color: #999999; background: transparent; }
-#tags button.occupied { color: #000000; }
-#tags button.focused { color: #ffffff; background: #000000; }
-#tags button.urgent { color: #ffffff; background: #b03030; }
+window#waybar { background: #f0f0f1; color: #383a42; border-bottom: 1px solid #383a42; }
+#tags button { padding: 0 6px; color: #a0a1a7; background: transparent; }
+#tags button.occupied { color: #383a42; }
+#tags button.focused { color: #f0f0f1; background: #383a42; }
+#tags button.urgent { color: #fafafa; background: #e44649; }
 #window { padding: 0 10px; }
 #battery { padding: 0 10px; }
-#battery.charging, #battery.plugged { color: #2e7d32; }
-#battery.warning:not(.charging) { color: #c06000; }
-#battery.critical:not(.charging) { color: #ffffff; background: #b03030; }
+#battery.charging, #battery.plugged { color: #50a14f; }
+#battery.warning:not(.charging) { color: #c18401; }
+#battery.critical:not(.charging) { color: #fafafa; background: #e44649; }
 #clock { padding: 0 10px; }
