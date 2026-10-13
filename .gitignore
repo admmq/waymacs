@@ -1,0 +1,7 @@
+# build output
+/build/
+/waymacs
+*.o
+# byte-compiled elisp
+*.elc
+*.eln

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Copyright (C) 2026 Adam Quandour
+# SPDX-License-Identifier: GPL-3.0-or-later (see COPYING)
+# waymacs-session - start waymacs as a display manager's session.
+#
+# Display managers start Wayland sessions without a login shell, so
+# /etc/profile, /etc/profile.d/* and ~/.profile are not read, and Emacs
+# and the applications miss what they set up (PATH, Guix, ...).  Like
+# GNOME's gnome-session, go through the user's login shell first.
+# Arguments are passed to waymacs.
+
+waymacs=@BINDIR@/waymacs
+case "${SHELL:-}" in
+*/bash | */zsh | */ksh | */mksh | */dash | */sh) login_shell=$SHELL ;;
+*) login_shell=/bin/sh ;;	# fish, nushell...: other syntax
+esac
+exec "$login_shell" -l -c 'exec "$0" "$@"' "$waymacs" "$@"

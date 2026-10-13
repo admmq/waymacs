@@ -1,0 +1,28 @@
+// Copyright (C) 2026 Adam Quandour
+// SPDX-License-Identifier: GPL-3.0-or-later (see COPYING)
+// waybar configuration for waymacs.
+// waymacs speaks River's status protocols, so the river/* modules show
+// its workspaces (tags 1-10 = workspaces 1-10) and the focused window.
+//   waybar -c contrib/waybar/config.jsonc -s contrib/waybar/style.css
+{
+  "layer": "top",
+  "position": "top",
+  "height": 32,
+  "modules-left": ["river/tags"],
+  "modules-center": ["river/window"],
+  "modules-right": ["battery", "clock"],
+  "river/tags": {
+    "num-tags": 10,
+    "tag-labels": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
+  },
+  "river/window": { "max-length": 80 },
+  // the first battery found; hidden on machines without one
+  "battery": {
+    "states": { "warning": 25, "critical": 10 },
+    "format": "BAT {capacity}%",
+    "format-charging": "CHR {capacity}%",
+    "format-plugged": "AC {capacity}%",
+    "tooltip-format": "{timeTo}"
+  },
+  "clock": { "format": "{:%a %d %b  %H:%M}" }
+}

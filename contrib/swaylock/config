@@ -1,0 +1,7 @@
+# Copyright (C) 2026 Adam Quandour
+# SPDX-License-Identifier: GPL-3.0-or-later (see COPYING)
+# swaylock configuration for waymacs: a black lock screen.
+# swaylock paints the screen white unless told otherwise.  Copy to
+# ~/.config/swaylock/config, or run swaylock -C contrib/swaylock/config.
+# See man swaylock for the other settings.
+color=000000

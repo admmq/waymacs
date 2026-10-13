@@ -1,0 +1,8 @@
+# Copyright (C) 2026 Adam Quandour
+# SPDX-License-Identifier: GPL-3.0-or-later (see COPYING)
+[Desktop Entry]
+Name=waymacs
+Comment=Emacs as a Wayland window manager
+Exec=@BINDIR@/waymacs-session -- @EMACS@ -l @LISPDIR@/waymacs.el -f waymacs-enable
+Type=Application
+DesktopNames=waymacs
