@@ -155,6 +155,21 @@ Loading waymacs on the command line, not in your init file, means only
 the session's Emacs loads it: an Emacs you start inside the session reads
 the same init file but stays an ordinary application.
 
+Additional settings can be put is ~/.emacs using with-eval-after-load:
+
+```elisp
+...
+
+(with-eval-after-load 'waymacs
+  ;; run waybar
+  (start-process "waybar" nil "waybar")
+  ;; set keyboard
+  (setq waymacs-xkb-layout "us,ru"
+        waymacs-xkb-options "grp:win_space_toggle"))
+
+...
+```
+
 Emacs reads its command line only after the init file and
 `after-init-hook` have run without error.  If they fail (a package the
 session's Emacs cannot find, say), waymacs is never loaded and Emacs
