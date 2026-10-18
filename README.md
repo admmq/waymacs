@@ -53,14 +53,21 @@ session.  It does not install `waymacs.el`: the session file starts Emacs
 with this checkout's copy,
 
 ```
-Exec=/usr/local/bin/waymacs-session -- emacs -l /path/to/waymacs/lisp/waymacs.el -f waymacs-enable
+Exec=/usr/local/bin/waymacs-session emacs /path/to/waymacs/lisp
 ```
 
 ## Running
 
 ```sh
-waymacs -- emacs -l /path/to/waymacs/lisp/waymacs.el -f waymacs-enable
-waymacs -d -- emacs ...       # with debug logging
+waymacs emacs /path/to/waymacs/lisp     # Emacs and the directory of waymacs.el
+waymacs -d emacs /path/to/waymacs/lisp  # with debug logging
+```
+
+`waymacs EMACS LISPDIR` runs `EMACS -l LISPDIR/waymacs.el -f
+waymacs-enable`.  To start Emacs some other way, give the whole command:
+
+```sh
+waymacs -- emacs -Q -l ~/my-init.el -l /path/to/waymacs/lisp/waymacs.el -f waymacs-enable
 waymacs -s 'emacs ...'        # the command as one shell string
 ```
 
@@ -87,33 +94,3 @@ Additional settings can be put is ~/.emacs using with-eval-after-load:
 
 ...
 ```
-
-## Emacs configuration
-
-The session's Emacs loads waymacs from its command line (see Running), so
-your init file needs nothing.  To configure waymacs, wrap the settings in
-`with-eval-after-load`; they then run only in the session's Emacs:
-
-```elisp
-(with-eval-after-load 'waymacs
-  (menu-bar-mode -1)
-  (tool-bar-mode -1)
-  (setq waymacs-input-simulation-keys
-        '(([?\C-b] . [left]) ([?\C-f] . [right])
-          ([?\C-p] . [up]) ([?\C-n] . [down])
-          ([?\C-a] . [home]) ([?\C-e] . [end])
-          ([?\M-v] . [prior]) ([?\C-v] . [next])
-          ([?\C-d] . [delete]) ([?\C-k] . [S-end delete])
-          ([?\M-w] . [?\C-c]) ([?\C-y] . [?\C-v])))
-  (add-to-list 'waymacs-input-char-mode-apps "\\`foot\\'")   ; terminals
-  (setq waymacs-xkb-layout "us,ru"
-        waymacs-xkb-options "ctrl:nocaps,grp:alt_shift_toggle"))
-```
-
-`waymacs-enable` runs after the init file, so these settings are in place
-when it starts.  (Calling `(require 'waymacs)` and `(waymacs-enable)` from
-the init file still works, but then every Emacs loads waymacs; one started
-inside the session does not take over, it only carries the code.)
-
-
-material).

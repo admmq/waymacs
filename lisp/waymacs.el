@@ -384,6 +384,13 @@ except keys bound to `waymacs-input-forward-key'."
   "<home>" #'waymacs-input-forward-key "<end>" #'waymacs-input-forward-key
   "<prior>" #'waymacs-input-forward-key "<next>" #'waymacs-input-forward-key)
 
+(defvar waymacs--floating-keys nil
+  "Non-nil while a floating window has the keyboard.")
+
+(defvar waymacs--floating-map-alist `((waymacs--floating-keys . ,waymacs-mode-map))
+  "Makes `waymacs-mode-map' active while a floating window has the keyboard.
+Its buffer is shown in no window, so its own keymap is not.")
+
 (define-derived-mode waymacs-mode nil "Waymacs"
   "Major mode of buffers standing for Wayland application windows.
 Displaying the buffer in a window shows the application there.
@@ -531,7 +538,24 @@ A monitor just connected gets the workspaces that belong there."
     (unless (or old (buffer-local-value 'waymacs--floating buffer))
       (if (active-minibuffer-window)
           (push buffer waymacs--pending-display)
-        (pop-to-buffer-same-window buffer)))))
+        (waymacs--display-new buffer)))))
+
+(defun waymacs--display-new (buffer)
+  "Show and select BUFFER, a new application window.
+It takes the selected window, as in EXWM, unless that window shows
+another window of the same program (another Emacs's new frame, say):
+that one stays in view and BUFFER goes in another window."
+  (let ((pid (buffer-local-value 'waymacs-pid buffer))
+        (shown (window-buffer)))
+    (if (and pid (> pid 0)
+             (buffer-local-value 'waymacs--id shown)
+             (eql pid (buffer-local-value 'waymacs-pid shown)))
+        (pop-to-buffer buffer '((display-buffer-pop-up-window display-buffer-use-some-window)
+                                (inhibit-same-window . t)))
+      (pop-to-buffer-same-window buffer))
+    ;; no other window to be had: the selected one, then
+    (unless (get-buffer-window buffer t)
+      (pop-to-buffer-same-window buffer))))
 
 (defun waymacs--on-update (event)
   "Record the new app id and title in EVENT."
@@ -714,7 +738,9 @@ the compositor uses the first one it can."
   (let* ((window (selected-window))
          (frame-id (frame-parameter (window-frame window) 'waymacs-id))
          (id (waymacs--window-id window)))
-    (unless (eq window waymacs--last-window)
+    ;; Selecting another window takes the focus from a floating window;
+    ;; a prompt (M-x...) gives it back when done.
+    (unless (or (eq window waymacs--last-window) (window-minibuffer-p window))
       (setq waymacs--last-window window
             waymacs--floating-focus nil))
     (cond ((waymacs--emacs-input-p) (and frame-id (cons frame-id t)))
@@ -790,6 +816,8 @@ With FORCE-FOCUS, send the focus even if it did not change."
         (setq waymacs--last-minibuffer position)
         (waymacs--send "minibuffer" (car position) (cdr position))))
     (let ((target (waymacs--focus-target)))
+      (setq waymacs--floating-keys (and target (not (cdr target))
+                                        (eql (car target) waymacs--floating-focus)))
       (when (and target (or force-focus (not (equal target waymacs--last-focus))))
         (setq waymacs--last-focus target)
         (waymacs--send "focus" (car target))))))
@@ -800,7 +828,7 @@ With FORCE-FOCUS, send the focus even if it did not change."
     (dolist (buffer (nreverse (prog1 waymacs--pending-display
                                 (setq waymacs--pending-display nil))))
       (when (and (buffer-live-p buffer) (not (get-buffer-window buffer 'visible)))
-        (pop-to-buffer-same-window buffer))))
+        (waymacs--display-new buffer))))
   (if (input-pending-p)
       ;; More keys are on their way to Emacs; keep the keyboard until
       ;; they are handled, then send the focus.
@@ -892,9 +920,16 @@ With FORCE-FOCUS, send the focus even if it did not change."
   (global-set-key key command)
   (waymacs-input--update-keys))
 
+(defun waymacs--current-buffer ()
+  "Buffer of the application that commands act on, or nil.
+That is the focused floating window, else the one in the selected window."
+  (or (waymacs--buffer waymacs--floating-focus)
+      (and (waymacs--window-id) (window-buffer))))
+
 (defun waymacs--current-id ()
-  "Id of the application in the selected window, or signal an error."
-  (or (waymacs--window-id) (user-error "Not an application window")))
+  "Id of the application that commands act on, or signal an error."
+  (let ((buffer (or (waymacs--current-buffer) (user-error "Not an application window"))))
+    (buffer-local-value 'waymacs--id buffer)))
 
 (defun waymacs-input--set-char-mode (on)
   "Put the current buffer's application in char mode if ON, else line mode."
@@ -905,22 +940,19 @@ With FORCE-FOCUS, send the focus even if it did not change."
 (defun waymacs-input-char-mode ()
   "Send all keys except global ones to the selected application."
   (interactive)
-  (with-current-buffer (window-buffer)
-    (waymacs--current-id)
+  (with-current-buffer (waymacs--buffer (waymacs--current-id))
     (waymacs-input--set-char-mode t)))
 
 (defun waymacs-input-line-mode ()
   "Let prefix keys of the selected application go to Emacs."
   (interactive)
-  (with-current-buffer (window-buffer)
-    (waymacs--current-id)
+  (with-current-buffer (waymacs--buffer (waymacs--current-id))
     (waymacs-input--set-char-mode nil)))
 
 (defun waymacs-input-toggle-keyboard ()
   "Toggle the selected application between line and char mode."
   (interactive)
-  (with-current-buffer (window-buffer)
-    (waymacs--current-id)
+  (with-current-buffer (waymacs--buffer (waymacs--current-id))
     (waymacs-input--set-char-mode (not waymacs--char-mode))
     (message "waymacs: %s mode" (if waymacs--char-mode "char" "line"))))
 
@@ -942,10 +974,10 @@ With FORCE-FOCUS, send the focus even if it did not change."
        id))))
 
 (defun waymacs-input-forward-key ()
-  "Type the last key in this buffer's application."
+  "Type the last key in the application that has the keyboard."
   (interactive)
-  (when waymacs--id
-    (waymacs-input-send-key (vector last-input-event) waymacs--id)))
+  (when-let* ((buffer (waymacs--current-buffer)))
+    (waymacs-input-send-key (vector last-input-event) (buffer-local-value 'waymacs--id buffer))))
 
 ;;; Commands
 
@@ -957,30 +989,25 @@ With FORCE-FOCUS, send the focus even if it did not change."
 (defun waymacs-toggle-fullscreen ()
   "Toggle fullscreen for the application in the selected window."
   (interactive)
-  (let ((buffer (or (and (waymacs--window-id) (window-buffer))
-                    (waymacs--buffer waymacs--floating-focus)
-                    (user-error "Not an application window"))))
-    (with-current-buffer buffer
-      (waymacs--send "fullscreen" waymacs--id (if waymacs--fullscreen 0 1)))))
+  (with-current-buffer (waymacs--buffer (waymacs--current-id))
+    (waymacs--send "fullscreen" waymacs--id (if waymacs--fullscreen 0 1))))
 
 (defun waymacs-floating-toggle ()
   "Float the application in the selected window, or tile the focused floating one."
   (interactive)
-  (let ((floating (waymacs--buffer waymacs--floating-focus))
-        (id (waymacs--window-id)))
-    (cond (floating
-           (setq waymacs--floating-focus nil)
-           (with-current-buffer floating (setq waymacs--floating nil))
-           (waymacs--send "float" (buffer-local-value 'waymacs--id floating) 0)
-           (switch-to-buffer floating))
-          (id
-           (let ((buffer (window-buffer)))
-             (with-current-buffer buffer (setq waymacs--floating t))
-             (waymacs--send "float" id 1)
-             (replace-buffer-in-windows buffer)
-             (setq waymacs--floating-focus id
-                   waymacs--last-window (selected-window))))
-          (t (user-error "Not an application window")))))
+  (let* ((id (waymacs--current-id))
+         (buffer (waymacs--buffer id)))
+    (if (buffer-local-value 'waymacs--floating buffer)
+        (progn
+          (setq waymacs--floating-focus nil)
+          (with-current-buffer buffer (setq waymacs--floating nil))
+          (waymacs--send "float" id 0)
+          (switch-to-buffer buffer))
+      (with-current-buffer buffer (setq waymacs--floating t))
+      (waymacs--send "float" id 1)
+      (replace-buffer-in-windows buffer)
+      (setq waymacs--floating-focus id
+            waymacs--last-window (selected-window)))))
 
 (defun waymacs-reset ()
   "Reset the selected application: line mode, not fullscreen; resync everything."
@@ -1208,6 +1235,7 @@ The workspace is made if needed, without showing it.  See also
     (add-hook 'minibuffer-setup-hook #'waymacs--sync)
     (add-hook 'after-make-frame-functions #'waymacs--tag-frame)
     (advice-add 'select-frame-set-input-focus :after #'waymacs--after-select-frame)
+    (add-to-list 'emulation-mode-map-alists 'waymacs--floating-map-alist)
     (let ((waymacs--making-background-frame t))
       (mapc #'waymacs--tag-frame (frame-list)))
     (add-to-list 'global-mode-string waymacs--mode-line-construct t)
@@ -1232,6 +1260,8 @@ Call this from your init file; it does nothing outside waymacs."
   (remove-hook 'minibuffer-setup-hook #'waymacs--sync)
   (remove-hook 'after-make-frame-functions #'waymacs--tag-frame)
   (advice-remove 'select-frame-set-input-focus #'waymacs--after-select-frame)
+  (setq emulation-mode-map-alists (delq 'waymacs--floating-map-alist emulation-mode-map-alists)
+        waymacs--floating-keys nil)
   (setq global-mode-string (delete waymacs--mode-line-construct global-mode-string))
   (when (waymacs--connected-p)
     (delete-process waymacs--process))

@@ -173,8 +173,17 @@ name="floating"
 elisp '(waymacs-floating-toggle)' > /dev/null
 check wait_for "(and waymacs--floating-focus (not (get-buffer-window $foot_buffer)) t)"
 grim "$work/floating.png" 2> /dev/null
+# its buffer is in no window, yet its keys (C-c C-t C-f) work
+name="C-c C-t C-f typed in the floating window tiles it"
+type_keys -M ctrl ctf -m ctrl
+check wait_for "(and (get-buffer-window $foot_buffer) (not (buffer-local-value (quote waymacs--floating) $foot_buffer)) t)"
+
+name="M-x over a floating window acts on it"
 elisp '(waymacs-floating-toggle)' > /dev/null
-wait_for "(and (get-buffer-window $foot_buffer) t)"
+wait_for "(and waymacs--floating-focus t)"
+type_keys -M alt x -m alt
+type_keys "waymacs-floating-toggle" -k Return
+check wait_for "(and (get-buffer-window $foot_buffer) t)"
 
 name="menus of applications get the keyboard (GTK3)"
 if python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2> /dev/null; then
@@ -256,6 +265,15 @@ name="M-x typed in another Emacs goes to it"
 check_m_x() { [ "$(elisp '(and (active-minibuffer-window) t)')" = nil ]; }
 check check_m_x
 type_keys -M ctrl g -m ctrl
+
+name="another Emacs's new frame goes in another window, leaving it in view"
+child_elisp() { emacsclient -s "waymacs-smoke-child-$$" -e "$1" 2>/dev/null; }
+emacs_windows='(cl-count-if (lambda (window) (string-match-p "emacs" (or (buffer-local-value (quote waymacs-app-id) (window-buffer window)) ""))) (window-list))'
+child_elisp '(progn (make-frame (quote ((name . "second")))) t)' > /dev/null
+check wait_for "(= $emacs_windows 2)"
+child_elisp '(delete-frame (cl-find "second" (frame-list) :key (lambda (frame) (frame-parameter frame (quote name))) :test (function equal)))' > /dev/null
+wait_for "(= $emacs_windows 1)"
+elisp "(progn (select-window (get-buffer-window $emacs_buffer)) (delete-other-windows))" > /dev/null
 elisp "(kill-buffer $emacs_buffer)" > /dev/null
 wait_for "(null $emacs_buffer)"
 

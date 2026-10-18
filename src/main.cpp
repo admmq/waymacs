@@ -11,13 +11,14 @@ struct waymacs server;
 static void usage(const char *program)
 {
 	fprintf(stderr,
-		"usage: %s [-d] [-s command | -- program [argument...]]\n"
-		"  -s command  run the shell COMMAND\n"
-		"  -- program  run PROGRAM with its arguments, without a shell\n"
-		"              (default: $WAYMACS_EMACS or \"emacs\");\n"
-		"              the session ends when it exits\n"
-		"  -d          debug logging\n"
-		"example: %s -- emacs -l /path/to/waymacs/lisp/waymacs.el -f waymacs-enable\n",
+		"usage: %s [-d] [emacs lispdir | -s command | -- program [argument...]]\n"
+		"  emacs lispdir  run EMACS -l LISPDIR/waymacs.el -f waymacs-enable\n"
+		"  -s command     run the shell COMMAND\n"
+		"  -- program     run PROGRAM with its arguments, without a shell\n"
+		"                 (default: $WAYMACS_EMACS or \"emacs\");\n"
+		"                 the session ends when it exits\n"
+		"  -d             debug logging\n"
+		"example: %s emacs /path/to/waymacs/lisp\n",
 		program, program);
 }
 
@@ -99,7 +100,9 @@ int main(int argc, char **argv)
 	const char *startup_command = getenv("WAYMACS_EMACS");
 	enum wlr_log_importance log_level = WLR_INFO;
 	int option;
-	while ((option = getopt(argc, argv, "s:dh")) != -1) {
+	/* `+': stop at the first non-option, so that `waymacs emacs lispdir'
+	 * and `waymacs -- program...' can be told apart */
+	while ((option = getopt(argc, argv, "+s:dh")) != -1) {
 		switch (option) {
 		case 's': startup_command = optarg; break;
 		case 'd': log_level = WLR_DEBUG; break;
@@ -107,12 +110,30 @@ int main(int argc, char **argv)
 		default: usage(argv[0]); return 1;
 		}
 	}
-	/* what to run: the words after `--', the -s shell command, or emacs */
+	bool after_dashes = optind > 1 && strcmp(argv[optind - 1], "--") == 0;
+	/* what to run: emacs with waymacs.el, the words after `--', the -s
+	 * shell command, or emacs */
 	static char shell[] = "/bin/sh", shell_option[] = "-c", emacs[] = "emacs";
+	static char load_option[] = "-l", funcall_option[] = "-f", enable[] = "waymacs-enable";
+	char lisp_file[4096];
 	char *shell_argv[] = { shell, shell_option, NULL, NULL };
 	char *emacs_argv[] = { emacs, NULL };
+	char *waymacs_emacs_argv[] = { NULL, load_option, lisp_file, funcall_option, enable, NULL };
 	char *const *command_argv;
-	if (optind < argc) {
+	if (optind < argc && !after_dashes) {
+		if (argc - optind != 2) {
+			usage(argv[0]);
+			return 1;
+		}
+		if ((size_t)snprintf(lisp_file, sizeof lisp_file, "%s/waymacs.el",
+				     argv[optind + 1]) >= sizeof lisp_file
+		    || access(lisp_file, R_OK) != 0) {
+			fprintf(stderr, "waymacs: cannot read %s/waymacs.el\n", argv[optind + 1]);
+			return 1;
+		}
+		waymacs_emacs_argv[0] = argv[optind];
+		command_argv = waymacs_emacs_argv;
+	} else if (optind < argc) {
 		command_argv = &argv[optind];
 	} else if (startup_command && *startup_command) {
 		shell_argv[2] = (char *)startup_command;

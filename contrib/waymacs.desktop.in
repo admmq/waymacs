@@ -3,6 +3,6 @@
 [Desktop Entry]
 Name=waymacs
 Comment=Emacs as a Wayland window manager
-Exec=@BINDIR@/waymacs-session -- @EMACS@ -l @LISPDIR@/waymacs.el -f waymacs-enable
+Exec=@BINDIR@/waymacs-session @EMACS@ @LISPDIR@
 Type=Application
 DesktopNames=waymacs
