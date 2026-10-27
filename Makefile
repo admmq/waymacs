@@ -12,8 +12,10 @@ PKGS = $(WLROOTS) wayland-server xkbcommon libinput pixman-1 xcb
 WAYLAND_PROTOCOLS := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)
 WAYLAND_SCANNER := $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scanner)
 
+# optimization and debug info, yours to override
 CXXFLAGS ?= -O2 -g
-CXXFLAGS += -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra \
+# flags waymacs always needs
+WAYMACS_CXXFLAGS = -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra \
 	-Wno-unused-parameter -Wno-missing-field-initializers \
 	-DWLR_USE_UNSTABLE -Ibuild $(shell $(PKG_CONFIG) --cflags $(PKGS))
 LDLIBS += $(shell $(PKG_CONFIG) --libs $(PKGS))
@@ -32,11 +34,15 @@ PROTO = build/xdg-shell-protocol.h \
 
 all: waymacs
 
+# unoptimized build with full debug info (make clean first if already built)
+debug: CXXFLAGS = -O0 -g3
+debug: waymacs
+
 waymacs: $(OBJ)
 	$(CXX) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 build/%.o: src/%.cpp src/waymacs.h $(PROTO)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(WAYMACS_CXXFLAGS) -c -o $@ $<
 
 build/xdg-shell-protocol.h:
 	@mkdir -p build
@@ -82,4 +88,4 @@ uninstall:
 clean:
 	rm -rf build waymacs lisp/*.elc
 
-.PHONY: all test check install uninstall clean
+.PHONY: all debug test check install uninstall clean
