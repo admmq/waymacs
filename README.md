@@ -94,3 +94,12 @@ Additional settings can be put is ~/.emacs using with-eval-after-load:
 
 ...
 ```
+
+## How to debug with gdb
+
+build with these flags CXXFLAGS ?= -O0 -g3 and run gdb
+
+```bash
+env -u EMACSLOADPATH -u EMACSNATIVELOADPATH \
+  gdb --args ./waymacs -d -- emacs-pgtk -Q -l test/init.el -l lisp/waymacs.el -f waymacs-enable
+```
