@@ -1,3 +1,5 @@
+![desktop example](./contrib/example.png)
+
 # Message from HUMAN
 
 Hi, Adam here. This project is almost entirely LLM-generated.
