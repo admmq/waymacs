@@ -582,6 +582,11 @@ that one stays in view and BUFFER goes in another window."
     (when buffer
       (with-current-buffer buffer
         (setq waymacs--id nil))
+      ;; Replace it ourselves: `kill-buffer' would put back any previous
+      ;; buffer, even an application shown in another window, which would
+      ;; then move here.
+      (dolist (window (get-buffer-window-list buffer 'never t))
+        (waymacs--replace-in-window window buffer))
       (kill-buffer buffer))))
 
 (defun waymacs--on-activate (event)
