@@ -19,7 +19,7 @@ window is selected it gets the keyboard, except for prefix keys such as
 
 waymacs has two parts:
 
-- `waymacs`, a small Wayland compositor written in C-style C++ on top of
+- `waymacs`, a small Wayland compositor written in C++17 on top of
   [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots).  It shows
   Emacs frames, puts application windows where Emacs says, moves the
   keyboard focus and hands prefix keys to Emacs.  It makes no window

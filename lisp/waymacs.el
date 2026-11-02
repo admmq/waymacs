@@ -561,16 +561,16 @@ that one stays in view and BUFFER goes in another window."
   "Record the new app id and title in EVENT."
   (when-let* ((buffer (waymacs--buffer (plist-get event :id))))
     (with-current-buffer buffer
-      (let ((app (plist-get event :app))
-            (title (plist-get event :title)))
-        (unless (and (equal app waymacs-app-id) (equal title waymacs-title))
-          (let ((app-changed (not (equal app waymacs-app-id)))
-                (title-changed (not (equal title waymacs-title))))
-            (setq waymacs-app-id app
-                  waymacs-title title)
-            (waymacs--rename-buffer)
-            (when app-changed (run-hooks 'waymacs-update-app-id-hook))
-            (when title-changed (run-hooks 'waymacs-update-title-hook))))))))
+      (let* ((app (plist-get event :app))
+             (title (plist-get event :title))
+             (app-changed (not (equal app waymacs-app-id)))
+             (title-changed (not (equal title waymacs-title))))
+        (when (or app-changed title-changed)
+          (setq waymacs-app-id app
+                waymacs-title title)
+          (waymacs--rename-buffer)
+          (when app-changed (run-hooks 'waymacs-update-app-id-hook))
+          (when title-changed (run-hooks 'waymacs-update-title-hook)))))))
 
 (defun waymacs--on-close (event)
   "Kill the buffer of the window that EVENT says is gone."
@@ -771,25 +771,27 @@ A Wayland window has one size and position, so it can only be drawn in
 one Emacs window; other windows showing its buffer (after `C-x 3', for
 example) switch to another buffer.  The selected window keeps it, or
 else the window that showed it first."
-  (maphash
-   (lambda (_id buffer)
-     (let ((windows (and (buffer-live-p buffer)
-                         (get-buffer-window-list buffer 'never t))))
-       (when (cdr windows)
-         (let ((keep (if (memq (selected-window) windows)
-                         (selected-window)
-                       (or (cl-find-if (lambda (window)
-                                         (and (memq window windows)
-                                              (eq (window-buffer window) buffer)))
-                                       waymacs--shown-windows)
-                           (car windows)))))
-           (dolist (window windows)
-             (unless (eq window keep)
-               (waymacs--replace-in-window window buffer)))))))
-   waymacs--buffers)
+  (let (windows-of)
+    ;; (BUFFER . WINDOWS) for each application shown, in one pass over
+    ;; the windows rather than one per application
+    (dolist (window (nreverse (window-list-1 nil 'never t)))
+      (when (waymacs--window-id window)
+        (push window (alist-get (window-buffer window) windows-of))))
+    (maphash
+     (lambda (_id buffer)
+       (let ((windows (alist-get buffer windows-of)))
+         (when (cdr windows)
+           (let ((keep (if (memq (selected-window) windows)
+                           (selected-window)
+                         (or (cl-find-if (lambda (window) (memq window windows))
+                                         waymacs--shown-windows)
+                             (car windows)))))
+             (dolist (window windows)
+               (unless (eq window keep)
+                 (waymacs--replace-in-window window buffer)))))))
+     waymacs--buffers))
   (setq waymacs--shown-windows
-        (cl-remove-if-not (lambda (window) (waymacs--window-id window))
-                          (window-list-1 nil 'never t))))
+        (cl-remove-if-not #'waymacs--window-id (window-list-1 nil 'never t))))
 
 (defun waymacs--sync (&optional force-focus)
   "Send the layout and the focus to the compositor if they changed.

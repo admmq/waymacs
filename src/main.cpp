@@ -6,7 +6,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-struct waymacs server;
+Server server;
+
+void Server::listen(wl_signal *signal, Listener::Handler handler)
+{
+	listeners.push_back(std::make_unique<Listener>());
+	listeners.back()->listen(signal, std::move(handler));
+}
 
 static void usage(const char *program)
 {
@@ -22,9 +28,12 @@ static void usage(const char *program)
 		program, program);
 }
 
-/* Run COMMAND_ARGV (a NULL-terminated argument vector). */
-static void spawn(char *const command_argv[])
+static void spawn(const std::vector<std::string> &command)
 {
+	std::vector<char *> command_argv;
+	for (const std::string &word : command)
+		command_argv.push_back(const_cast<char *>(word.c_str()));
+	command_argv.push_back(nullptr);
 	pid_t pid = fork();
 	if (pid < 0) {
 		wlr_log_errno(WLR_ERROR, "fork");
@@ -34,9 +43,9 @@ static void spawn(char *const command_argv[])
 		/* wl_event_loop_add_signal() blocked these in the parent */
 		sigset_t signals;
 		sigemptyset(&signals);
-		sigprocmask(SIG_SETMASK, &signals, NULL);
+		sigprocmask(SIG_SETMASK, &signals, nullptr);
 		setsid();
-		execvp(command_argv[0], command_argv);
+		execvp(command_argv[0], command_argv.data());
 		fprintf(stderr, "waymacs: cannot run %s\n", command_argv[0]);
 		_exit(127);
 	}
@@ -72,23 +81,6 @@ static int check_emacs_connected(void *data)
 	return 0;
 }
 
-/* Stop listening to the objects that are about to be destroyed (wlroots
- * 0.19 checks that nothing listens to an object it destroys).  Windows,
- * outputs and keyboards detach themselves as they go. */
-static void detach_listeners(void)
-{
-	stop_listening(&server.new_output, &server.output_layout_change, &server.new_toplevel,
-		       &server.new_popup, &server.new_layer_surface, &server.new_decoration,
-		       &server.request_activate, &server.new_input, &server.new_virtual_keyboard,
-		       &server.new_virtual_pointer, &server.request_cursor_shape,
-		       &server.cursor_motion, &server.cursor_motion_absolute,
-		       &server.cursor_button, &server.cursor_axis, &server.cursor_frame,
-		       &server.request_cursor, &server.request_selection,
-		       &server.request_primary_selection, &server.request_start_drag,
-		       &server.new_lock, &server.lock_new_surface, &server.lock_unlock,
-		       &server.lock_destroy, &server.lock_manager_destroy);
-}
-
 static int handle_sigterm(int signal_number, void *data)
 {
 	wl_display_terminate(server.display);
@@ -98,7 +90,7 @@ static int handle_sigterm(int signal_number, void *data)
 int main(int argc, char **argv)
 {
 	const char *startup_command = getenv("WAYMACS_EMACS");
-	enum wlr_log_importance log_level = WLR_INFO;
+	wlr_log_importance log_level = WLR_INFO;
 	int option;
 	/* `+': stop at the first non-option, so that `waymacs emacs lispdir'
 	 * and `waymacs -- program...' can be told apart */
@@ -113,44 +105,26 @@ int main(int argc, char **argv)
 	bool after_dashes = optind > 1 && strcmp(argv[optind - 1], "--") == 0;
 	/* what to run: emacs with waymacs.el, the words after `--', the -s
 	 * shell command, or emacs */
-	static char shell[] = "/bin/sh", shell_option[] = "-c", emacs[] = "emacs";
-	static char load_option[] = "-l", funcall_option[] = "-f", enable[] = "waymacs-enable";
-	char lisp_file[4096];
-	char *shell_argv[] = { shell, shell_option, NULL, NULL };
-	char *emacs_argv[] = { emacs, NULL };
-	char *waymacs_emacs_argv[] = { NULL, load_option, lisp_file, funcall_option, enable, NULL };
-	char *const *command_argv;
+	std::vector<std::string> command;
 	if (optind < argc && !after_dashes) {
 		if (argc - optind != 2) {
 			usage(argv[0]);
 			return 1;
 		}
-		if ((size_t)snprintf(lisp_file, sizeof lisp_file, "%s/waymacs.el",
-				     argv[optind + 1]) >= sizeof lisp_file
-		    || access(lisp_file, R_OK) != 0) {
-			fprintf(stderr, "waymacs: cannot read %s/waymacs.el\n", argv[optind + 1]);
+		std::string lisp_file = std::string(argv[optind + 1]) + "/waymacs.el";
+		if (access(lisp_file.c_str(), R_OK) != 0) {
+			fprintf(stderr, "waymacs: cannot read %s\n", lisp_file.c_str());
 			return 1;
 		}
-		waymacs_emacs_argv[0] = argv[optind];
-		command_argv = waymacs_emacs_argv;
+		command = { argv[optind], "-l", lisp_file, "-f", "waymacs-enable" };
 	} else if (optind < argc) {
-		command_argv = &argv[optind];
+		command.assign(argv + optind, argv + argc);
 	} else if (startup_command && *startup_command) {
-		shell_argv[2] = (char *)startup_command;
-		command_argv = shell_argv;
+		command = { "/bin/sh", "-c", startup_command };
 	} else {
-		command_argv = emacs_argv;
+		command = { "emacs" };
 	}
-	wlr_log_init(log_level, NULL);
-
-	wl_list_init(&server.outputs);
-	wl_list_init(&server.disabled_outputs);
-	wl_list_init(&server.views);
-	wl_list_init(&server.keyboards);
-	server.next_view_id = 1;
-	server.ipc_fd = server.ipc_listen_fd = -1;
-	server.repeat_rate = 25;
-	server.repeat_delay = 600;
+	wlr_log_init(log_level, nullptr);
 
 	server.display = wl_display_create();
 	server.event_loop = wl_display_get_event_loop(server.display);
@@ -195,7 +169,7 @@ int main(int argc, char **argv)
 	wlr_xdg_output_manager_v1_create(server.display, server.output_layout);
 	server.scene = wlr_scene_create();
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
-	struct wlr_scene_tree *root = &server.scene->tree;
+	wlr_scene_tree *root = &server.scene->tree;
 	server.background_tree = wlr_scene_tree_create(root);
 	server.layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND] = wlr_scene_tree_create(root);
 	server.layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM] = wlr_scene_tree_create(root);
@@ -230,12 +204,12 @@ int main(int argc, char **argv)
 	ipc_init(socket_name);
 	wlr_log(WLR_INFO, "running on WAYLAND_DISPLAY=%s", socket_name);
 
-	wl_event_loop_add_signal(server.event_loop, SIGCHLD, handle_sigchld, NULL);
-	wl_event_loop_add_signal(server.event_loop, SIGINT, handle_sigterm, NULL);
-	wl_event_loop_add_signal(server.event_loop, SIGTERM, handle_sigterm, NULL);
-	spawn(command_argv);
+	wl_event_loop_add_signal(server.event_loop, SIGCHLD, handle_sigchld, nullptr);
+	wl_event_loop_add_signal(server.event_loop, SIGINT, handle_sigterm, nullptr);
+	wl_event_loop_add_signal(server.event_loop, SIGTERM, handle_sigterm, nullptr);
+	spawn(command);
 	wl_event_source_timer_update(
-		wl_event_loop_add_timer(server.event_loop, check_emacs_connected, NULL), 15000);
+		wl_event_loop_add_timer(server.event_loop, check_emacs_connected, nullptr), 15000);
 
 	wl_display_run(server.display);
 	server.quitting = true;
@@ -244,7 +218,11 @@ int main(int argc, char **argv)
 		kill(server.child_pid, SIGTERM);
 	ipc_finish();
 	xwayland_finish();
-	detach_listeners();
+	/* Stop listening to the objects that are about to be destroyed
+	 * (wlroots 0.19 checks that nothing listens to an object it
+	 * destroys).  Windows, outputs and keyboards detach themselves as
+	 * they go. */
+	server.listeners.clear();
 	wl_display_destroy_clients(server.display);
 	/* outputs go first: their destroy handlers still use the scene */
 	wlr_backend_destroy(server.backend);

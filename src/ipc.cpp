@@ -10,37 +10,41 @@
 #include "waymacs.h"
 #include <errno.h>
 #include <stdarg.h>
+#include <sstream>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-bool ipc_connected(void)
+static int listen_fd = -1, client_fd = -1;
+static wl_event_source *listen_source, *client_source;
+static std::string socket_path, received_text, unsent_text;
+
+bool ipc_connected()
 {
-	return server.ipc_fd >= 0;
+	return client_fd >= 0;
 }
 
-static void ipc_close(void)
+static void ipc_close()
 {
-	if (server.ipc_source)
-		wl_event_source_remove(server.ipc_source);
-	if (server.ipc_fd >= 0)
-		close(server.ipc_fd);
-	server.ipc_source = NULL;
-	server.ipc_fd = -1;
-	server.ipc_input_length = server.ipc_output_length = 0;
+	if (client_source)
+		wl_event_source_remove(client_source);
+	if (client_fd >= 0)
+		close(client_fd);
+	client_source = nullptr;
+	client_fd = -1;
+	received_text.clear();
+	unsent_text.clear();
 }
 
-static void ipc_flush(void)
+static void ipc_flush()
 {
-	while (server.ipc_fd >= 0 && server.ipc_output_length > 0) {
-		ssize_t sent = send(server.ipc_fd, server.ipc_output,
-				    server.ipc_output_length, MSG_NOSIGNAL);
+	while (client_fd >= 0 && !unsent_text.empty()) {
+		ssize_t sent = send(client_fd, unsent_text.data(), unsent_text.size(), MSG_NOSIGNAL);
 		if (sent < 0 && errno == EINTR)
 			continue;
 		if (sent < 0 && errno == EAGAIN) {
 			/* finish when the socket is writable again */
-			wl_event_source_fd_update(server.ipc_source,
-						  WL_EVENT_READABLE | WL_EVENT_WRITABLE);
+			wl_event_source_fd_update(client_source, WL_EVENT_READABLE | WL_EVENT_WRITABLE);
 			return;
 		}
 		if (sent < 0) {
@@ -48,251 +52,210 @@ static void ipc_flush(void)
 			ipc_close();
 			return;
 		}
-		memmove(server.ipc_output, server.ipc_output + sent,
-			server.ipc_output_length - sent);
-		server.ipc_output_length -= sent;
+		unsent_text.erase(0, sent);
 	}
-	if (server.ipc_source)
-		wl_event_source_fd_update(server.ipc_source, WL_EVENT_READABLE);
-}
-
-/* Make *BUFFER (of *CAPACITY bytes) hold at least NEEDED bytes. */
-static void buffer_reserve(char **buffer, size_t *capacity, size_t needed)
-{
-	if (needed <= *capacity)
-		return;
-	size_t new_capacity = *capacity ? *capacity : 4096;
-	while (new_capacity < needed)
-		new_capacity *= 2;
-	*buffer = (char *)realloc(*buffer, new_capacity);
-	if (!*buffer)
-		abort();
-	*capacity = new_capacity;
 }
 
 void ipc_send(const char *format, ...)
 {
-	if (server.ipc_fd < 0)
+	if (client_fd < 0)
 		return;
 	va_list args;
 	va_start(args, format);
-	int length = vsnprintf(NULL, 0, format, args);
+	char *text;
+	int length = vasprintf(&text, format, args);
 	va_end(args);
 	if (length < 0)
 		return;
-	buffer_reserve(&server.ipc_output, &server.ipc_output_capacity,
-		       server.ipc_output_length + length + 2);
-	va_start(args, format);
-	vsnprintf(server.ipc_output + server.ipc_output_length, length + 1, format, args);
-	va_end(args);
-	server.ipc_output_length += length;
-	server.ipc_output[server.ipc_output_length++] = '\n';
+	unsent_text.append(text, length).push_back('\n');
+	free(text);
 	ipc_flush();
 }
 
 /* TEXT as a Lisp string literal, in one of four rotating buffers. */
 const char *lisp_string(const char *text)
 {
-	static char buffers[4][1024];
+	static std::string buffers[4];
 	static int next_buffer;
-	char *result = buffers[next_buffer++ % 4];
-	size_t length = 0;
-	result[length++] = '"';
-	for (; text && *text && length < sizeof buffers[0] - 3; text++) {
+	std::string &result = buffers[next_buffer++ % 4];
+	result = '"';
+	for (; text && *text; text++) {
 		unsigned char character = *text;
 		if (character == '"' || character == '\\')
-			result[length++] = '\\';
-		result[length++] = character < 0x20 ? ' ' : character;
+			result += '\\';
+		result += character < 0x20 ? ' ' : character;
 	}
-	result[length++] = '"';
-	result[length] = 0;
-	return result;
+	result += '"';
+	return result.c_str();
 }
 
 /* Key specs look like MODIFIERS:cCODEPOINT or MODIFIERS:sKEYSYM-NAME. */
-bool parse_key_spec(const char *text, struct key_spec *key, bool lowercase)
+static bool parse_key_spec(const std::string &text, KeySpec &key, bool lowercase)
 {
 	char *rest;
-	unsigned long modifiers = strtoul(text, &rest, 10);
+	unsigned long modifiers = strtoul(text.c_str(), &rest, 10);
 	if (*rest != ':')
 		return false;
 	rest++;
 	if (*rest == 'c')
-		key->keysym = xkb_utf32_to_keysym(strtoul(rest + 1, NULL, 10));
+		key.keysym = xkb_utf32_to_keysym(strtoul(rest + 1, nullptr, 10));
 	else if (*rest == 's')
-		key->keysym = xkb_keysym_from_name(rest + 1, XKB_KEYSYM_CASE_INSENSITIVE);
+		key.keysym = xkb_keysym_from_name(rest + 1, XKB_KEYSYM_CASE_INSENSITIVE);
 	else
 		return false;
-	if (key->keysym == XKB_KEY_NoSymbol)
+	if (key.keysym == XKB_KEY_NoSymbol)
 		return false;
 	if (lowercase)
-		key->keysym = xkb_keysym_to_lower(key->keysym);
-	key->modifiers = modifiers & MODIFIER_MASK;
+		key.keysym = xkb_keysym_to_lower(key.keysym);
+	key.modifiers = modifiers & MODIFIER_MASK;
 	return true;
 }
 
-static int parse_key_list(int argc, char **argv, struct key_spec *keys)
+static std::vector<KeySpec> parse_key_list(const std::vector<std::string> &words, size_t first,
+					   bool lowercase)
 {
-	int count = 0;
-	for (int i = 1; i < argc && count < MAX_KEYS; i++) {
-		if (parse_key_spec(argv[i], &keys[count], true))
-			count++;
+	std::vector<KeySpec> keys;
+	for (size_t i = first; i < words.size(); i++) {
+		KeySpec key;
+		if (parse_key_spec(words[i], key, lowercase))
+			keys.push_back(key);
 		else
-			wlr_log(WLR_ERROR, "ipc: bad key spec `%s'", argv[i]);
+			wlr_log(WLR_ERROR, "ipc: bad key spec `%s'", words[i].c_str());
 	}
-	return count;
+	return keys;
 }
 
 /* simulation-keys FROM=TO[,TO...] ... */
-static void parse_simulation_keys(int argc, char **argv)
+static void parse_simulation_keys(const std::vector<std::string> &words)
 {
-	server.simulation_key_count = 0;
-	for (int i = 1; i < argc && server.simulation_key_count < MAX_KEYS; i++) {
-		struct simulation_key *simulation =
-			&server.simulation_keys[server.simulation_key_count];
-		char *equals = strchr(argv[i], '=');
-		if (!equals)
+	server.simulation_keys.clear();
+	for (size_t i = 1; i < words.size(); i++) {
+		size_t equals = words[i].find('=');
+		SimulationKey simulation;
+		if (equals == std::string::npos ||
+		    !parse_key_spec(words[i].substr(0, equals), simulation.from, true))
 			continue;
-		*equals = 0;
-		if (!parse_key_spec(argv[i], &simulation->from, true))
-			continue;
-		simulation->count = 0;
-		char *position = NULL;
-		for (char *target = strtok_r(equals + 1, ",", &position);
-		     target && simulation->count < MAX_SIMULATED_KEYS;
-		     target = strtok_r(NULL, ",", &position))
-			if (parse_key_spec(target, &simulation->to[simulation->count], false))
-				simulation->count++;
-		if (simulation->count > 0)
-			server.simulation_key_count++;
+		std::istringstream targets(words[i].substr(equals + 1));
+		std::string target;
+		KeySpec key;
+		while (std::getline(targets, target, ','))
+			if (parse_key_spec(target, key, false))
+				simulation.to.push_back(key);
+		if (!simulation.to.empty())
+			server.simulation_keys.push_back(simulation);
 	}
 }
 
-static struct view *view_argument(int argc, char **argv, int index)
+static void handle_command(const std::string &line)
 {
-	return index < argc ? view_by_id(strtoul(argv[index], NULL, 10)) : NULL;
-}
-
-/* "-" stands for an empty string */
-static void copy_argument(char *destination, size_t size, const char *argument)
-{
-	snprintf(destination, size, "%s", strcmp(argument, "-") ? argument : "");
-}
-
-static void handle_command(char *line)
-{
-	static char *argv[2048];
-	int argc = 0;
-	char *position = NULL;
-	for (char *word = strtok_r(line, " \t\r", &position); word && argc < 2048;
-	     word = strtok_r(NULL, " \t\r", &position))
-		argv[argc++] = word;
-	if (argc == 0)
+	std::vector<std::string> words;
+	std::istringstream stream(line);
+	for (std::string word; stream >> word;)
+		words.push_back(word);
+	if (words.empty())
 		return;
-	const char *command = argv[0];
-	struct view *view = view_argument(argc, argv, 1);
+	const std::string &command = words[0];
+	size_t argc = words.size();
+	auto number = [&words](size_t i) { return atoi(words[i].c_str()); };
+	auto id = [&words](size_t i) { return (uint32_t)strtoul(words[i].c_str(), nullptr, 10); };
+	/* "-" stands for an empty string */
+	auto text = [&words](size_t i) { return words[i] == "-" ? std::string() : words[i]; };
+	View *view = argc > 1 ? view_by_id(id(1)) : nullptr;
 	bool app = view && view->mapped && !view->is_frame;
+	bool frame = view && view->is_frame;
 
-	if (!strcmp(command, "hello") && argc > 1) {
-		emacs_hello(atoi(argv[1]));
-	} else if (!strcmp(command, "layout")) {
+	if (command == "hello" && argc > 1) {
+		emacs_hello(number(1));
+	} else if (command == "layout") {
 		layout_begin();
-		for (int i = 1; i + 5 < argc; i += 6)
-			layout_add(strtoul(argv[i], NULL, 10), strtoul(argv[i + 1], NULL, 10),
-				   atoi(argv[i + 2]), atoi(argv[i + 3]),
-				   atoi(argv[i + 4]), atoi(argv[i + 5]));
+		for (size_t i = 1; i + 5 < argc; i += 6)
+			layout_add(id(i), id(i + 1), number(i + 2), number(i + 3),
+				   number(i + 4), number(i + 5));
 		layout_end();
-	} else if (!strcmp(command, "focus")) {
+	} else if (command == "focus") {
 		if (view && view->mapped)
 			focus_view(view, true);
-	} else if (!strcmp(command, "global-keys")) {
-		server.global_key_count = parse_key_list(argc, argv, server.global_keys);
-	} else if (!strcmp(command, "prefix-keys")) {
-		server.prefix_key_count = parse_key_list(argc, argv, server.prefix_keys);
-	} else if (!strcmp(command, "simulation-keys")) {
-		parse_simulation_keys(argc, argv);
-	} else if (!strcmp(command, "mode") && app && argc > 2) {
-		view->char_mode = !strcmp(argv[2], "char");
-	} else if (!strcmp(command, "fullscreen") && app && argc > 2) {
-		view_set_fullscreen(view, atoi(argv[2]));
-	} else if (!strcmp(command, "float") && app && argc > 2) {
-		view_set_floating(view, atoi(argv[2]));
-	} else if (!strcmp(command, "assign") && app && argc > 2) {
+	} else if (command == "global-keys") {
+		server.global_keys = parse_key_list(words, 1, true);
+	} else if (command == "prefix-keys") {
+		server.prefix_keys = parse_key_list(words, 1, true);
+	} else if (command == "simulation-keys") {
+		parse_simulation_keys(words);
+	} else if (command == "mode" && app && argc > 2) {
+		view->char_mode = words[2] == "char";
+	} else if (command == "fullscreen" && app && argc > 2) {
+		view_set_fullscreen(view, number(2));
+	} else if (command == "float" && app && argc > 2) {
+		view_set_floating(view, number(2));
+	} else if (command == "assign" && app && argc > 2) {
 		/* a floating window moves to another workspace (0: none yet) */
-		view_set_frame(view, view_argument(argc, argv, 2));
-	} else if (!strcmp(command, "workspaces")) {
+		view_set_frame(view, view_by_id(id(2)));
+	} else if (command == "workspaces") {
 		/* workspaces FRAME NUMBER ...: frames left out have none; frame 0
 		 * stands for a workspace not shown yet (no surface) */
-		struct view *frame;
-		wl_list_for_each(frame, &server.views, link)
-			frame->workspace = 0;
+		for (View *other : server.views)
+			other->workspace = 0;
 		server.unshown_workspace_tags = 0;
-		for (int i = 1; i + 1 < argc; i += 2) {
-			int number = atoi(argv[i + 1]);
-			unsigned long frame_id = strtoul(argv[i], NULL, 10);
-			if (frame_id == 0 && number >= 1 && number <= 32)
-				server.unshown_workspace_tags |= 1u << (number - 1);
-			else if ((frame = view_by_id(frame_id)) && frame->is_frame)
-				frame->workspace = number;
+		for (size_t i = 1; i + 1 < argc; i += 2) {
+			int workspace = number(i + 1);
+			View *other = view_by_id(id(i));
+			if (id(i) == 0 && workspace >= 1 && workspace <= 32)
+				server.unshown_workspace_tags |= 1u << (workspace - 1);
+			else if (other && other->is_frame)
+				other->workspace = workspace;
 		}
 		bar_update();
-	} else if (!strcmp(command, "minibuffer") && view && view->is_frame && argc > 2) {
+	} else if (command == "minibuffer" && frame && argc > 2) {
 		/* where the frame's minibuffer starts, for fullscreen windows */
-		view->minibuffer_top = atoi(argv[2]);
+		view->minibuffer_top = number(2);
 		arrange();
-	} else if (!strcmp(command, "frame-output") && view && view->is_frame && argc > 2) {
-		struct output *output = output_by_name(argv[2], true);
-		if (output)
+	} else if (command == "frame-output" && frame && argc > 2) {
+		if (Output *output = output_by_name(words[2].c_str(), true))
 			frame_move_to_output(view, output);
-	} else if (!strcmp(command, "output-enable") && argc > 2) {
+	} else if (command == "output-enable" && argc > 2) {
 		/* output-enable OUTPUT 0|1: turn a monitor off or on */
-		struct output *output = output_by_name(argv[1], false);
-		if (output)
-			output_set_enabled(output, atoi(argv[2]) != 0);
-	} else if (!strcmp(command, "frame-place") && view && view->is_frame && argc > 2) {
+		if (Output *output = output_by_name(words[1].c_str(), false))
+			output_set_enabled(output, number(2) != 0);
+	} else if (command == "frame-place" && frame && argc > 2) {
 		/* frame-place FRAME OUTPUT: like frame-output, without focusing it */
-		struct output *output = output_by_name(argv[2], true);
-		if (output)
+		if (Output *output = output_by_name(words[2].c_str(), true))
 			frame_set_output(view, output);
-	} else if (!strcmp(command, "close") && app) {
-		view_close(view, false);
-	} else if (!strcmp(command, "kill") && app) {
-		view_close(view, true);
-	} else if (!strcmp(command, "key") && app) {
-		struct key_spec keys[MAX_SIMULATED_KEYS];
-		int count = 0;
-		for (int i = 2; i < argc && count < MAX_SIMULATED_KEYS; i++)
-			if (parse_key_spec(argv[i], &keys[count], false))
-				count++;
+	} else if ((command == "close" || command == "kill") && app) {
+		view->close(command == "kill");
+	} else if (command == "key" && app) {
+		std::vector<KeySpec> keys = parse_key_list(words, 2, false);
 		if (server.focused_view != view)
 			focus_view(view, false);
-		inject_keys(keys, count);
-	} else if (!strcmp(command, "xkb") && argc > 3) {
-		copy_argument(server.xkb_layout, sizeof server.xkb_layout, argv[1]);
-		copy_argument(server.xkb_variant, sizeof server.xkb_variant, argv[2]);
-		copy_argument(server.xkb_options, sizeof server.xkb_options, argv[3]);
+		inject_keys(keys);
+	} else if (command == "xkb" && argc > 3) {
+		server.xkb_layout = text(1);
+		server.xkb_variant = text(2);
+		server.xkb_options = text(3);
 		keyboards_reconfigure();
-	} else if (!strcmp(command, "repeat") && argc > 2) {
-		server.repeat_rate = atoi(argv[1]);
-		server.repeat_delay = atoi(argv[2]);
+	} else if (command == "repeat" && argc > 2) {
+		server.repeat_rate = number(1);
+		server.repeat_delay = number(2);
 		keyboards_reconfigure();
-	} else if (!strcmp(command, "quit")) {
+	} else if (command == "quit") {
 		wl_display_terminate(server.display);
 	} else {
-		wlr_log(WLR_DEBUG, "ipc: ignored command `%s'", command);
+		wlr_log(WLR_DEBUG, "ipc: ignored command `%s'", command.c_str());
 	}
 }
 
-static int handle_ipc_readable(int client_fd, uint32_t mask, void *data)
+static int handle_ipc_readable(int fd, uint32_t mask, void *)
 {
-	if (mask & WL_EVENT_WRITABLE)
+	if (mask & WL_EVENT_WRITABLE) {
 		ipc_flush();
+		if (client_source && unsent_text.empty())	/* all sent: stop waiting */
+			wl_event_source_fd_update(client_source, WL_EVENT_READABLE);
+	}
+	if (client_fd < 0)
+		return 0;	/* the flush failed */
 	if (mask & WL_EVENT_READABLE) {
+		char buffer[4096];
 		for (;;) {
-			buffer_reserve(&server.ipc_input, &server.ipc_input_capacity,
-				       server.ipc_input_length + 4096);
-			ssize_t received = read(client_fd, server.ipc_input + server.ipc_input_length,
-						server.ipc_input_capacity - server.ipc_input_length);
+			ssize_t received = read(fd, buffer, sizeof buffer);
 			if (received < 0 && errno == EINTR)
 				continue;
 			if (received < 0 && errno == EAGAIN)
@@ -302,52 +265,49 @@ static int handle_ipc_readable(int client_fd, uint32_t mask, void *data)
 				ipc_close();
 				return 0;
 			}
-			server.ipc_input_length += received;
+			received_text.append(buffer, received);
 		}
-		char *line = server.ipc_input;
-		char *end = server.ipc_input + server.ipc_input_length;
-		char *newline;
-		while ((newline = (char *)memchr(line, '\n', end - line))) {
-			*newline = 0;
+		size_t start = 0, newline;
+		while ((newline = received_text.find('\n', start)) != std::string::npos) {
+			std::string line = received_text.substr(start, newline - start);
+			start = newline + 1;
 			handle_command(line);
-			if (server.ipc_fd < 0)
+			if (client_fd < 0)
 				return 0;
-			line = newline + 1;
 		}
-		server.ipc_input_length = end - line;
-		memmove(server.ipc_input, line, server.ipc_input_length);
+		received_text.erase(0, start);
 	} else if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		ipc_close();
 	}
 	return 0;
 }
 
-static int handle_ipc_connection(int listen_fd, uint32_t mask, void *data)
+static int handle_ipc_connection(int fd, uint32_t mask, void *)
 {
-	int client_fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
-	if (client_fd < 0)
+	int new_fd = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+	if (new_fd < 0)
 		return 0;
-	struct ucred credentials;
+	ucred credentials;
 	socklen_t length = sizeof credentials;
-	if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) < 0 ||
+	if (getsockopt(new_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) < 0 ||
 	    credentials.uid != getuid()) {
-		close(client_fd);
+		close(new_fd);
 		return 0;
 	}
-	if (server.ipc_fd >= 0) {
+	if (client_fd >= 0) {
 		/* Only the session's Emacs manages windows; another Emacs
 		 * started in the session is just an application. */
 		if (credentials.pid != server.emacs_pid) {
 			wlr_log(WLR_INFO, "ipc: refused a second Emacs (pid %d)", credentials.pid);
-			close(client_fd);
+			close(new_fd);
 			return 0;
 		}
 		wlr_log(WLR_INFO, "ipc: Emacs reconnected");
 		ipc_close();
 	}
-	server.ipc_fd = client_fd;
-	server.ipc_source = wl_event_loop_add_fd(server.event_loop, client_fd,
-						 WL_EVENT_READABLE, handle_ipc_readable, NULL);
+	client_fd = new_fd;
+	client_source = wl_event_loop_add_fd(server.event_loop, client_fd, WL_EVENT_READABLE,
+					     handle_ipc_readable, nullptr);
 	wlr_log(WLR_INFO, "ipc: Emacs connected (pid %d)", credentials.pid);
 	return 0;
 }
@@ -355,40 +315,36 @@ static int handle_ipc_connection(int listen_fd, uint32_t mask, void *data)
 void ipc_init(const char *display_name)
 {
 	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
-	struct sockaddr_un address;
-	memset(&address, 0, sizeof address);
+	sockaddr_un address = {};
 	address.sun_family = AF_UNIX;
-	int length = snprintf(address.sun_path, sizeof address.sun_path, "%s/waymacs-%s.sock",
-			      runtime_dir ? runtime_dir : "/tmp", display_name);
-	if (length < 0 || (size_t)length >= sizeof address.sun_path) {
+	socket_path = std::string(runtime_dir ? runtime_dir : "/tmp") + "/waymacs-" +
+		display_name + ".sock";
+	if (socket_path.size() >= sizeof address.sun_path) {
 		wlr_log(WLR_ERROR, "ipc: socket path too long");
 		return;
 	}
-	snprintf(server.socket_path, sizeof server.socket_path, "%s", address.sun_path);
-	int listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-	unlink(server.socket_path);
-	if (listen_fd < 0 || bind(listen_fd, (struct sockaddr *)&address, sizeof address) < 0 ||
-	    listen(listen_fd, 4) < 0) {
-		wlr_log_errno(WLR_ERROR, "ipc: cannot listen on %s", server.socket_path);
-		if (listen_fd >= 0)
-			close(listen_fd);
+	socket_path.copy(address.sun_path, socket_path.size());
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	unlink(socket_path.c_str());
+	if (fd < 0 || bind(fd, (sockaddr *)&address, sizeof address) < 0 || listen(fd, 4) < 0) {
+		wlr_log_errno(WLR_ERROR, "ipc: cannot listen on %s", socket_path.c_str());
+		if (fd >= 0)
+			close(fd);
 		return;
 	}
-	server.ipc_listen_fd = listen_fd;
-	server.ipc_listen_source = wl_event_loop_add_fd(server.event_loop, listen_fd, WL_EVENT_READABLE,
-							handle_ipc_connection, NULL);
-	setenv("WAYMACS_SOCKET", server.socket_path, 1);
+	listen_fd = fd;
+	listen_source = wl_event_loop_add_fd(server.event_loop, listen_fd, WL_EVENT_READABLE,
+					     handle_ipc_connection, nullptr);
+	setenv("WAYMACS_SOCKET", socket_path.c_str(), 1);
 }
 
-void ipc_finish(void)
+void ipc_finish()
 {
 	ipc_close();
-	if (server.ipc_listen_source)
-		wl_event_source_remove(server.ipc_listen_source);
-	if (server.ipc_listen_fd >= 0) {
-		close(server.ipc_listen_fd);
-		unlink(server.socket_path);
+	if (listen_source)
+		wl_event_source_remove(listen_source);
+	if (listen_fd >= 0) {
+		close(listen_fd);
+		unlink(socket_path.c_str());
 	}
-	free(server.ipc_input);
-	free(server.ipc_output);
 }
