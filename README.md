@@ -33,74 +33,63 @@ packages:
 
 ```sh
 sudo apt install libwlroots-0.18-dev libwayland-dev wayland-protocols \
-    libxkbcommon-dev libpixman-1-dev libinput-dev pkgconf emacs-pgtk \
-    xwayland foot grim wtype wlrctl wayland-utils
+    libxkbcommon-dev libpixman-1-dev libinput-dev pkgconf emacs-pgtk xwayland
 ```
 
 Emacs must be a pgtk build: the session Emacs's frames must be Wayland
-windows.
+windows.  wlroots 0.19 is supported too.
 
 ## Building
 
 ```sh
-make            # builds ./waymacs
-make check      # byte-compiles lisp/waymacs.el, warnings are errors
-make test       # end-to-end test without any display (see below)
+make                 # builds ./waymacs
+make check           # byte-compiles lisp/waymacs.el, warnings are errors
+make test            # end-to-end test without a display (needs foot grim wtype wlrctl)
 sudo make install    # /usr/local: waymacs, waymacs-session, the session file
 ```
 
-`make install` puts `waymacs.desktop` in
-`$(PREFIX)/share/wayland-sessions`, so display managers offer a "waymacs"
-session.  It does not install `waymacs.el`: the session file starts Emacs
-with this checkout's copy,
-
-```
-Exec=/usr/local/bin/waymacs-session emacs /path/to/waymacs/lisp
-```
+`make install` adds a "waymacs" session to display managers.  It does not
+install `waymacs.el`: the session uses this checkout's copy.
 
 ## Running
 
 ```sh
 waymacs emacs /path/to/waymacs/lisp     # Emacs and the directory of waymacs.el
 waymacs -d emacs /path/to/waymacs/lisp  # with debug logging
+test/run-nested.sh                      # try it in a window of your desktop
 ```
 
 `waymacs EMACS LISPDIR` runs `EMACS -l LISPDIR/waymacs.el -f
-waymacs-enable`.  To start Emacs some other way, give the whole command:
+waymacs-enable`, and the session ends when Emacs exits.  To start Emacs
+differently, give the whole command after `--` (`waymacs -h` lists the
+other options):
 
 ```sh
 waymacs -- emacs -Q -l ~/my-init.el -l /path/to/waymacs/lisp/waymacs.el -f waymacs-enable
-waymacs -s 'emacs ...'        # the command as one shell string
 ```
-
-The words after `--` are the program to run and its arguments (no shell
-involved); without them waymacs runs `-s`'s shell command, else
-`$WAYMACS_EMACS`, else plain `emacs`.  The session ends when that program
-exits.
 
 Loading waymacs on the command line, not in your init file, means only
 the session's Emacs loads it: an Emacs you start inside the session reads
-the same init file but stays an ordinary application.
-
-Additional settings can be put is ~/.emacs using with-eval-after-load:
+the same init file but stays an ordinary application.  Put your settings
+in your init file, in `with-eval-after-load`:
 
 ```elisp
-...
-
 (with-eval-after-load 'waymacs
-  ;; run waybar
+  ;; a status bar
   (start-process "waybar" nil "waybar")
-  ;; set keyboard
+  ;; keyboard, monitors, touchpad
   (setq waymacs-xkb-layout "us,ru"
-        waymacs-xkb-options "grp:win_space_toggle"))
-
-...
+        waymacs-xkb-options "grp:win_space_toggle"
+        waymacs-output-settings '((internal :scale 1.5))
+        waymacs-pointer-settings '((touchpad :natural-scroll t))))
 ```
+
+`M-x customize-group RET waymacs` lists all the settings.
 
 ## How to debug with gdb
 
 ```bash
-make debug
+make clean debug
 
 env -u EMACSLOADPATH -u EMACSNATIVELOADPATH \
   gdb --args ./waymacs -d -- emacs-pgtk -Q -l test/init.el -l lisp/waymacs.el -f waymacs-enable

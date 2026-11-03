@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -152,6 +153,17 @@ struct SimulationKey {
 	std::vector<KeySpec> to;
 };
 
+/* Settings from Emacs (waymacs-output-settings, waymacs-pointer-settings):
+ * the NAME=VALUE words of the command that sent them */
+struct Settings {
+	std::map<std::string, std::string> values;
+	const char *get(const char *name) const	/* null if not set */
+	{
+		auto found = values.find(name);
+		return found == values.end() ? nullptr : found->second.c_str();
+	}
+};
+
 enum class CursorMode { passthrough, move, resize };
 
 /* Every scene tree we own points (node.data) at one of these, so the
@@ -180,7 +192,10 @@ struct View : SceneOwner {
 	virtual void set_activated(bool activated) = 0;
 	virtual void set_fullscreen_state(bool fullscreen) = 0;
 	virtual View *parent() = 0;	/* the window it is a dialog of */
-	virtual bool wants_to_float() = 0;	/* dialogs, windows that cannot be resized */
+	/* Emacs decides from these whether the window floats */
+	virtual bool has_fixed_size() = 0;	/* it cannot be resized */
+	virtual bool is_modal() { return false; }	/* X11 windows only */
+	virtual const char *window_type() { return nullptr; }	/* X11: "dialog"... */
 	virtual void close(bool kill_client) = 0;
 	/* the node showing the window itself, without its popups */
 	virtual wlr_scene_node *surface_node() = 0;
@@ -307,6 +322,10 @@ struct Server {
 	std::vector<SimulationKey> simulation_keys;
 	std::string xkb_layout, xkb_variant, xkb_options;
 	int repeat_rate = 25, repeat_delay = 600;
+	/* waymacs-pointer-settings, and waymacs-output-settings by monitor
+	 * name (kept for a monitor plugged in again) */
+	Settings touchpad_settings, mouse_settings;
+	std::map<std::string, Settings> output_settings;
 
 	/* Listen to SIGNAL of an object that outlives the session's clients;
 	 * main() stops these before tearing the compositor down. */
@@ -345,6 +364,8 @@ void view_set_frame(View *app, View *frame);
 void view_request_activate(View *view);
 void frame_move_to_output(View *frame, Output *output);
 void frame_set_output(View *frame, Output *output);
+void frame_assign_output(View *frame, Output *output);
+void ask_frame_for_empty_output(Output *output);
 void layout_begin();
 void layout_add(uint32_t frame_id, uint32_t app_id, int x, int y, int width, int height);
 void layout_end();
@@ -353,6 +374,7 @@ void popup_create(wlr_xdg_popup *xdg_popup, wlr_scene_tree *parent_tree);
 /* input.cpp */
 void input_init();
 void keyboards_reconfigure();
+void pointers_reconfigure();
 void inject_keys(const std::vector<KeySpec> &keys);
 void update_pointer_focus();
 void begin_grab(View *view, CursorMode mode, uint32_t edges);	/* floating views only */
@@ -382,5 +404,6 @@ void output_init();
 void outputs_announce();
 Output *output_by_name(const char *name, bool enabled_only);
 void output_set_enabled(Output *output, bool enabled);
+void output_configure(const std::string &name, Settings settings);
 
 #endif

@@ -147,7 +147,8 @@ static void handle_new_layer_surface(void *data)
 
 /* OUTPUT, already out of server.outputs, is going away or turned off:
  * close its layer surfaces and move its frames to another output, the
- * focused one shown there. */
+ * focused one shown there.  Emacs learns where they went before it is told
+ * the output is gone, and may move them on. */
 static void output_leave(Output *output)
 {
 	for (std::vector<Layer *> &list : output->layers) {
@@ -158,7 +159,6 @@ static void output_leave(Output *output)
 			wlr_layer_surface_v1_destroy(layer->layer_surface);
 		}
 	}
-	ipc_send("(output-removed :name %s)", lisp_string(output->wlr_output->name));
 	bar_output_destroyed(output->wlr_output);
 
 	/* its frames move to the first remaining output */
@@ -167,35 +167,116 @@ static void output_leave(Output *output)
 	for (View *view : server.views) {
 		if (!view->is_frame || view->output != output)
 			continue;
-		view->output = destination;
+		frame_assign_output(view, destination);
 		if (destination && view->mapped &&
 		    (!destination->active_frame || view == focused_frame))
 			destination->active_frame = view;
 	}
 	output->active_frame = nullptr;
+	ipc_send("(output-removed :name %s)", lisp_string(output->wlr_output->name));
 	if (focused && focused->is_frame && !frame_is_visible(focused))
 		focus_fallback();
 	else
 		arrange();
 }
 
-/* Turn OUTPUT on, in its preferred mode, or off. */
-static bool output_commit_enabled(Output *output, bool enabled)
+/* waymacs-output-settings for OUTPUT */
+static const Settings &output_settings(Output *output)
 {
+	static const Settings none;
+	auto found = server.output_settings.find(output->wlr_output->name);
+	return found == server.output_settings.end() ? none : found->second;
+}
+
+/* Set the mode WIDTH x HEIGHT of OUTPUT in STATE, the one nearest HZ (0:
+ * the fastest).  False if it has no mode of that size. */
+static bool set_mode(struct wlr_output *wlr_output, wlr_output_state *state, int width,
+		     int height, double hz)
+{
+	int refresh = (int)(hz * 1000);		/* mHz */
+	if (wl_list_empty(&wlr_output->modes)) {
+		/* nested and headless outputs take any size */
+		if (width != wlr_output->width || height != wlr_output->height ||
+		    (refresh && refresh != wlr_output->refresh))
+			wlr_output_state_set_custom_mode(state, width, height, refresh);
+		return true;
+	}
+	wlr_output_mode *mode, *best = nullptr;
+	wl_list_for_each(mode, &wlr_output->modes, link)
+		if (mode->width == width && mode->height == height &&
+		    (!best || (refresh ? abs(mode->refresh - refresh) < abs(best->refresh - refresh) :
+			       mode->refresh > best->refresh)))
+			best = mode;
+	if (best && best != wlr_output->current_mode)
+		wlr_output_state_set_mode(state, best);
+	return best != nullptr;
+}
+
+static wl_output_transform transform_named(const char *name)
+{
+	static const char *const names[] = { "normal", "90", "180", "270", "flipped",
+					     "flipped-90", "flipped-180", "flipped-270" };
+	for (size_t i = 0; name && i < std::size(names); i++)
+		if (!strcmp(name, names[i]))
+			return static_cast<wl_output_transform>(i);
+	return WL_OUTPUT_TRANSFORM_NORMAL;
+}
+
+/* Turn OUTPUT on as SETTINGS say, or off.  What they leave out is the
+ * preferred mode (nested and headless outputs keep theirs), the scale
+ * $WAYMACS_SCALE or 1, no rotation. */
+static bool commit_state(Output *output, bool enabled, const Settings &settings)
+{
+	struct wlr_output *wlr_output = output->wlr_output;
 	wlr_output_state state;
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, enabled);
 	if (enabled) {
-		wlr_output_mode *mode = wlr_output_preferred_mode(output->wlr_output);
-		if (mode)
-			wlr_output_state_set_mode(&state, mode);
-		const char *scale = getenv("WAYMACS_SCALE");
-		if (scale && atof(scale) > 0)
-			wlr_output_state_set_scale(&state, atof(scale));
+		const char *mode = settings.get("mode");
+		int width, height;
+		double hz = 0;
+		if (!mode || sscanf(mode, "%dx%d@%lf", &width, &height, &hz) < 2 ||
+		    !set_mode(wlr_output, &state, width, height, hz)) {
+			if (mode)
+				wlr_log(WLR_ERROR, "output %s: no mode %s", wlr_output->name, mode);
+			wlr_output_mode *preferred = wlr_output_preferred_mode(wlr_output);
+			if (preferred && preferred != wlr_output->current_mode)
+				wlr_output_state_set_mode(&state, preferred);
+		}
+		const char *scale = settings.get("scale");
+		if (!scale || atof(scale) <= 0)
+			scale = getenv("WAYMACS_SCALE");
+		wlr_output_state_set_scale(&state, scale && atof(scale) > 0 ? atof(scale) : 1);
+		wlr_output_state_set_transform(&state, transform_named(settings.get("transform")));
 	}
-	bool committed = wlr_output_commit_state(output->wlr_output, &state);
+	bool committed = wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 	return committed;
+}
+
+/* Turn OUTPUT on as waymacs-output-settings say (with the defaults if the
+ * monitor refuses them), or off. */
+static bool output_commit_enabled(Output *output, bool enabled)
+{
+	const Settings &settings = output_settings(output);
+	if (commit_state(output, enabled, settings))
+		return true;
+	if (!enabled || settings.values.empty())
+		return false;
+	wlr_log(WLR_ERROR, "output %s refused its waymacs-output-settings, using the defaults",
+		output->wlr_output->name);
+	return commit_state(output, true, Settings());
+}
+
+/* Put OUTPUT in the layout where waymacs-output-settings say, else to the
+ * right of the others. */
+static wlr_output_layout_output *place_in_layout(Output *output)
+{
+	const char *position = output_settings(output).get("position");
+	int x, y;
+	if (position && sscanf(position, "%d,%d", &x, &y) == 2)
+		return wlr_output_layout_add(server.output_layout, output->wlr_output, x, y);
+	return wlr_output_layout_add_auto(server.output_layout, output->wlr_output);
 }
 
 /* Show OUTPUT: place it in the layout, render it, tell Emacs. */
@@ -206,8 +287,7 @@ static void output_show(Output *output)
 	server.outputs.push_back(output);
 	wlr_scene_node_set_enabled(&output->background->node, true);
 	wlr_scene_node_set_enabled(&output->lock_background->node, true);
-	wlr_output_layout_output *layout_output =
-		wlr_output_layout_add_auto(server.output_layout, wlr_output);
+	wlr_output_layout_output *layout_output = place_in_layout(output);
 	output->scene_output = wlr_scene_output_create(server.scene, wlr_output);
 	wlr_scene_output_layout_add_output(server.scene_layout, layout_output, output->scene_output);
 	wlr_output_layout_get_box(server.output_layout, wlr_output, &output->box);
@@ -218,13 +298,13 @@ static void output_show(Output *output)
 	for (View *view : server.views) {
 		if (!view->is_frame || view->output)
 			continue;
-		view->output = output;
+		frame_assign_output(view, output);
 		if (view->mapped && !output->active_frame)
 			output->active_frame = view;
 	}
 	if (ipc_connected()) {
 		outputs_announce();
-		ipc_send("(need-frame :output %s)", lisp_string(wlr_output->name));
+		ask_frame_for_empty_output(output);
 	}
 	arrange();
 }
@@ -298,6 +378,20 @@ void output_set_enabled(Output *output, bool enabled)
 	wlr_log(WLR_INFO, "output %s turned off", output->wlr_output->name);
 	ipc_send("(output-off :name %s)", lisp_string(output->wlr_output->name));
 	output_leave(output);
+}
+
+/* waymacs-output-settings for the monitor named NAME: applied now if it is
+ * on, else when it is turned on or connected. */
+void output_configure(const std::string &name, Settings settings)
+{
+	Settings &kept = server.output_settings[name];
+	if (kept.values == settings.values)
+		return;
+	kept = std::move(settings);
+	if (Output *output = output_by_name(name.c_str(), true)) {
+		output_commit_enabled(output, true);
+		place_in_layout(output);	/* the layout's change event arranges */
+	}
 }
 
 Output *output_by_name(const char *name, bool enabled_only)

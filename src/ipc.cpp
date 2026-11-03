@@ -146,6 +146,18 @@ static void parse_simulation_keys(const std::vector<std::string> &words)
 	}
 }
 
+/* words NAME=VALUE from FIRST on: output-settings, pointer-settings */
+static Settings parse_settings(const std::vector<std::string> &words, size_t first)
+{
+	Settings settings;
+	for (size_t i = first; i < words.size(); i++) {
+		size_t equals = words[i].find('=');
+		if (equals != std::string::npos)
+			settings.values[words[i].substr(0, equals)] = words[i].substr(equals + 1);
+	}
+	return settings;
+}
+
 static void handle_command(const std::string &line)
 {
 	std::vector<std::string> words;
@@ -236,6 +248,15 @@ static void handle_command(const std::string &line)
 		server.repeat_rate = number(1);
 		server.repeat_delay = number(2);
 		keyboards_reconfigure();
+	} else if (command == "output-settings" && argc > 1) {
+		/* output-settings OUTPUT NAME=VALUE...: waymacs-output-settings */
+		output_configure(words[1], parse_settings(words, 2));
+	} else if (command == "pointer-settings" && argc > 1 &&
+		   (words[1] == "touchpad" || words[1] == "mouse")) {
+		/* pointer-settings touchpad|mouse NAME=VALUE...: waymacs-pointer-settings */
+		(words[1] == "touchpad" ? server.touchpad_settings : server.mouse_settings) =
+			parse_settings(words, 2);
+		pointers_reconfigure();
 	} else if (command == "quit") {
 		wl_display_terminate(server.display);
 	} else {

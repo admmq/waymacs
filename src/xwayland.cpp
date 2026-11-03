@@ -12,12 +12,17 @@
 static wlr_xwayland *xwayland;
 static Listener xwayland_ready, new_xwayland_surface;
 
-/* window types (_NET_WM_WINDOW_TYPE) that float like dialogs */
-static const char *const floating_type_names[] = {
-	"_NET_WM_WINDOW_TYPE_DIALOG", "_NET_WM_WINDOW_TYPE_UTILITY",
-	"_NET_WM_WINDOW_TYPE_TOOLBAR", "_NET_WM_WINDOW_TYPE_SPLASH",
+/* window types (_NET_WM_WINDOW_TYPE) Emacs is told about, and their names
+ * there; by default (waymacs-floating-default) such windows float */
+static const struct {
+	const char *atom, *name;
+} window_type_names[] = {
+	{ "_NET_WM_WINDOW_TYPE_DIALOG", "dialog" },
+	{ "_NET_WM_WINDOW_TYPE_UTILITY", "utility" },
+	{ "_NET_WM_WINDOW_TYPE_TOOLBAR", "toolbar" },
+	{ "_NET_WM_WINDOW_TYPE_SPLASH", "splash" },
 };
-static std::array<xcb_atom_t, std::size(floating_type_names)> floating_types;
+static std::array<xcb_atom_t, std::size(window_type_names)> window_types;
 
 /* ---- ordinary windows: views ---- */
 
@@ -65,19 +70,24 @@ struct X11View : View {
 			static_cast<View *>(xwayland_surface->parent->data) : nullptr;
 	}
 
-	/* dialogs, splash screens, and windows that cannot be resized */
-	bool wants_to_float() override
+	bool has_fixed_size() override
 	{
-		if (xwayland_surface->modal || xwayland_surface->parent)
-			return true;
-		xcb_atom_t *types = xwayland_surface->window_type;
-		if (std::any_of(types, types + xwayland_surface->window_type_len, [](xcb_atom_t type) {
-			return type && std::count(floating_types.begin(), floating_types.end(), type);
-		}))
-			return true;
 		xcb_size_hints_t *hints = xwayland_surface->size_hints;
 		return hints && hints->min_width > 0 && hints->min_height > 0 &&
 		       hints->min_width == hints->max_width && hints->min_height == hints->max_height;
+	}
+
+	bool is_modal() override { return xwayland_surface->modal; }
+
+	/* the first of its window types that Emacs is told about */
+	const char *window_type() override
+	{
+		for (size_t i = 0; i < xwayland_surface->window_type_len; i++)
+			for (size_t known = 0; known < window_types.size(); known++)
+				if (xwayland_surface->window_type[i] &&
+				    xwayland_surface->window_type[i] == window_types[known])
+					return window_type_names[known].name;
+		return nullptr;
 	}
 
 	void close(bool kill_client) override
@@ -268,13 +278,13 @@ void X11Popup::handle_unmap()
 static void handle_ready(void *)
 {
 	xcb_connection_t *connection = wlr_xwayland_get_xwm_connection(xwayland);
-	std::array<xcb_intern_atom_cookie_t, std::size(floating_type_names)> cookies;
-	for (size_t i = 0; i < floating_types.size(); i++)
-		cookies[i] = xcb_intern_atom(connection, 0, strlen(floating_type_names[i]),
-					     floating_type_names[i]);
-	for (size_t i = 0; i < floating_types.size(); i++) {
+	std::array<xcb_intern_atom_cookie_t, std::size(window_type_names)> cookies;
+	for (size_t i = 0; i < window_types.size(); i++)
+		cookies[i] = xcb_intern_atom(connection, 0, strlen(window_type_names[i].atom),
+					     window_type_names[i].atom);
+	for (size_t i = 0; i < window_types.size(); i++) {
 		xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(connection, cookies[i], nullptr);
-		floating_types[i] = reply ? reply->atom : 0;
+		window_types[i] = reply ? reply->atom : 0;
 		free(reply);
 	}
 	wlr_xcursor_manager_load(server.xcursor_manager, 1);

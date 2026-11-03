@@ -52,21 +52,28 @@ static int frame_count(Output *output)
 	});
 }
 
-/* Like i3, every output always shows a workspace. */
-static void ask_frame_for_empty_output(Output *output)
+/* Tell Emacs when OUTPUT shows no workspace: like i3, it gives every
+ * output one. */
+void ask_frame_for_empty_output(Output *output)
 {
 	if (output && !frame_count(output))
 		ipc_send("(need-frame :output %s)", lisp_string(output->wlr_output->name));
 }
 
-/* New frames go to outputs without one first; then they stack (like
- * workspaces) on the output that has the focus. */
-static Output *output_for_new_frame()
+/* OUTPUT's name as Lisp, nil for none */
+static const char *lisp_output(Output *output)
 {
-	for (Output *output : server.outputs)
-		if (!frame_count(output))
-			return output;
-	return focused_output();
+	return output ? lisp_string(output->wlr_output->name) : "nil";
+}
+
+/* FRAME is now on OUTPUT (null: none).  Every change goes through here, so
+ * that Emacs knows where its frames are. */
+void frame_assign_output(View *frame, Output *output)
+{
+	if (frame->output == output)
+		return;
+	frame->output = output;
+	ipc_send("(frame-placed :id %u :output %s)", frame->id, lisp_output(output));
 }
 
 /* If OUTPUT shows FRAME, it shows the frame focused before it instead. */
@@ -175,12 +182,11 @@ struct XdgView : View {
 		return toplevel->parent ? static_cast<View *>(toplevel->parent->base->data) : nullptr;
 	}
 
-	bool wants_to_float() override
+	bool has_fixed_size() override
 	{
 		const wlr_xdg_toplevel_state &state = toplevel->current;
-		return toplevel->parent ||
-		       (state.min_width > 0 && state.min_height > 0 &&
-			state.min_width == state.max_width && state.min_height == state.max_height);
+		return state.min_width > 0 && state.min_height > 0 &&
+		       state.min_width == state.max_width && state.min_height == state.max_height;
 	}
 
 	void close(bool kill_client) override
@@ -264,8 +270,10 @@ void XdgView::handle_commit()
 		wlr_xdg_toplevel_set_wm_capabilities(toplevel,
 			WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
 		if (is_frame) {
+			/* Emacs names the frame's output in its title (see
+			 * view_title_changed); without that, the focused one */
 			if (!output)
-				output = output_for_new_frame();
+				frame_assign_output(this, focused_output());
 			wlr_xdg_toplevel_set_maximized(toplevel, true);
 			wlr_xdg_toplevel_set_activated(toplevel, true);
 			if (output) {
@@ -340,12 +348,17 @@ static void place_floating(View *view)
 			       area.y + (area.height - height) / 2, width, height };
 }
 
+/* Tell Emacs about an application window, including what it needs to
+ * decide whether the window floats. */
 static void view_announce(View *view)
 {
 	view->announced = true;
-	ipc_send("(new :id %u :app %s :title %s :pid %d :floating %s)", view->id,
-		 lisp_string(view->app_id()), lisp_string(view->title()),
-		 (int)view->pid, view->floating ? "t" : "nil");
+	const char *type = view->window_type();
+	ipc_send("(new :id %u :app %s :title %s :pid %d :floating %s :parent %s :modal %s"
+		 " :fixed-size %s :type %s)", view->id, lisp_string(view->app_id()),
+		 lisp_string(view->title()), (int)view->pid, view->floating ? "t" : "nil",
+		 view->parent() ? "t" : "nil", view->is_modal() ? "t" : "nil",
+		 view->has_fixed_size() ? "t" : "nil", type ? type : "nil");
 	if (view->fullscreen)
 		ipc_send("(fullscreen :id %u :state t)", view->id);
 }
@@ -353,7 +366,7 @@ static void view_announce(View *view)
 static void frame_map(View *frame)
 {
 	if (!frame->output)
-		frame->output = output_for_new_frame();
+		frame_assign_output(frame, focused_output());
 	wlr_scene_node_reparent(&frame->scene_tree->node, server.frame_tree);
 	bool take_focus = !server.focused_view || focused_output() == frame->output;
 	raise_frame(frame);
@@ -367,18 +380,21 @@ static void app_map(View *app)
 {
 	bar_view_mapped(app);
 	app->frame = current_frame();
-	app->unmanaged = !ipc_connected();
-	app->floating = app->unmanaged || app->wants_to_float();
-	if (app->floating)
+	/* Without Emacs the window floats.  Otherwise Emacs puts it in a
+	 * window or floats it (waymacs-floating-function); only a fullscreen
+	 * window is shown before that. */
+	app->unmanaged = app->floating = !ipc_connected();
+	if (app->unmanaged) {
 		place_floating(app);
-	if (!app->unmanaged)
-		view_announce(app);
-	if (app->floating || app->fullscreen) {
 		focus_view(app, false);
-		if (!app->unmanaged)
-			ipc_send("(activate :id %u)", app->id);
+		return;
+	}
+	view_announce(app);
+	if (app->fullscreen) {
+		focus_view(app, false);
+		ipc_send("(activate :id %u)", app->id);
 	} else {
-		arrange();	/* hidden until Emacs puts it in a window */
+		arrange();
 	}
 }
 
@@ -456,7 +472,8 @@ void view_title_changed(View *view)
 		return;
 	if (at)
 		frame_set_output(view, output_by_name(at + 1, true));
-	ipc_send("(frame :id %u :tag %s)", view->id, lisp_string(view->tag.c_str()));
+	ipc_send("(frame :id %u :tag %s :output %s)", view->id, lisp_string(view->tag.c_str()),
+		 lisp_output(view->output));
 }
 
 /* ---- popups (menus, tooltips) ---- */
@@ -782,15 +799,12 @@ void emacs_hello(pid_t pid)
 		ipc_send("(lid :closed t)");
 	for (View *view : server.views) {
 		if (view->is_frame && !view->tag.empty())
-			ipc_send("(frame :id %u :tag %s)", view->id, lisp_string(view->tag.c_str()));
+			ipc_send("(frame :id %u :tag %s :output %s)", view->id,
+				 lisp_string(view->tag.c_str()), lisp_output(view->output));
 		if (view->is_frame || !view->mapped || view->announced)
 			continue;
-		if (view->unmanaged) {
-			view->unmanaged = false;
-			view->floating = view->wants_to_float();
-			if (view->floating)
-				place_floating(view);
-		}
+		/* a window mapped without Emacs floats until Emacs decides */
+		view->unmanaged = false;
 		view_announce(view);
 	}
 	for (Output *output : server.outputs)
@@ -863,7 +877,7 @@ void frame_move_to_output(View *frame, Output *output)
 	if (old_output == output)
 		return;
 	stop_showing(old_output, frame);
-	frame->output = output;
+	frame_assign_output(frame, output);
 	place_floating_apps_of(frame);
 	focus_view(frame, true);
 	ask_frame_for_empty_output(old_output);
@@ -877,7 +891,7 @@ void frame_set_output(View *frame, Output *output)
 	Output *old_output = frame->output;
 	if (!output || old_output == output)
 		return;
-	frame->output = output;
+	frame_assign_output(frame, output);
 	if (!frame->mapped)
 		return;		/* frame_map() shows it */
 	stop_showing(old_output, frame);

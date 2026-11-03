@@ -40,13 +40,14 @@ check() { if "$@"; then pass "$name"; else fail "$name"; fi; }
 # type in the focused window; pause so Emacs can hand the keyboard back
 type_keys() { wtype "$@"; sleep 0.4; }
 
-# is the middle of the screen dark (foot) rather than light (Emacs)?
-center_is_dark() {
+# is the screen dark (foot) rather than light (Emacs) at X,Y?
+is_dark_at() {
 	sleep 0.5	# let the clients draw
-	brightness=$(grim -t ppm -g '640,360 1x1' - | tail -c 3 | od -An -tu1 |
+	brightness=$(grim -t ppm -g "$1 1x1" - | tail -c 3 | od -An -tu1 |
 		awk '{ print $1 + $2 + $3 }')
 	[ "${brightness:-765}" -lt 300 ]
 }
+center_is_dark() { is_dark_at 640,360; }
 center_is_light() { ! center_is_dark; }
 
 foot_buffer='(cl-find "foot" (buffer-list) :key (lambda (buffer) (buffer-local-value (quote waymacs-app-id) buffer)) :test (function equal))'
@@ -185,6 +186,47 @@ type_keys -M alt x -m alt
 type_keys "waymacs-floating-toggle" -k Return
 check wait_for "(and (get-buffer-window $foot_buffer) t)"
 
+name="waymacs-floating-function decides which windows float"
+float_buffer='(cl-find "float-test" (buffer-list) :key (lambda (buffer) (buffer-local-value (quote waymacs-app-id) buffer)) :test (function equal))'
+elisp '(progn (delete-other-windows) (switch-to-buffer "*scratch*") (setq waymacs-floating-function (lambda (_) (equal waymacs-app-id "float-test"))))' > /dev/null
+elisp '(waymacs-launch "foot --app-id=float-test")' > /dev/null
+check wait_for "(and (buffer-local-value (quote waymacs--floating) $float_buffer) (not (get-buffer-window $float_buffer t)) (equal waymacs--last-focus (list (buffer-local-value (quote waymacs--id) $float_buffer))))"
+name="the window it floats is on screen"
+check center_is_dark
+elisp "(progn (setq waymacs-floating-function (function waymacs-floating-default)) (kill-buffer $float_buffer))" > /dev/null
+wait_for "(null $float_buffer)"
+
+name="a window opened while Emacs was away gets an Emacs window when it is back"
+away_buffer='(cl-find "away-test" (buffer-list) :key (lambda (buffer) (buffer-local-value (quote waymacs-app-id) buffer)) :test (function equal))'
+elisp '(waymacs-disable)' > /dev/null
+elisp '(waymacs-launch "foot --app-id=away-test")' > /dev/null
+timeout 5 wlrctl toplevel waitfor app_id:away-test
+elisp '(waymacs-enable)' > /dev/null
+check wait_for "(and (eq (window-buffer) $away_buffer) (not (buffer-local-value (quote waymacs--floating) $away_buffer)) (equal waymacs--last-focus (list (waymacs--window-id))))"
+name="it fills the Emacs window"
+check is_dark_at 20,20
+elisp "(kill-buffer $away_buffer)" > /dev/null
+wait_for "(null $away_buffer)"
+
+# the monitor's size in the layout, as Emacs was told
+output_is() { echo "(let ((output (cdr (assoc \"HEADLESS-1\" waymacs--outputs)))) (and (eql (plist-get output :width) $1) (eql (plist-get output :height) $2) t))"; }
+name="waymacs-output-settings sets the scale"
+elisp '(customize-set-variable (quote waymacs-output-settings) (quote ((t :scale 2))))' > /dev/null
+check wait_for "$(output_is 640 360)"
+name="... the mode and the rotation, the rest being the default"
+elisp '(customize-set-variable (quote waymacs-output-settings) (quote ((t :mode "1024x768" :transform 90))))' > /dev/null
+check wait_for "$(output_is 768 1024)"
+name="the monitor is back as it was"
+elisp '(customize-set-variable (quote waymacs-output-settings) (quote ((t :mode "1280x720"))))' > /dev/null
+wait_for "$(output_is 1280 720)"
+elisp '(customize-set-variable (quote waymacs-output-settings) nil)' > /dev/null
+check wait_for "(and $(output_is 1280 720) (= (frame-pixel-height) 720))"
+
+name="waymacs-pointer-settings are sent"
+elisp '(customize-set-variable (quote waymacs-pointer-settings) (quote ((touchpad :tap nil :natural-scroll t) (t :accel-profile flat :accel-speed -0.5))))' > /dev/null
+check wait_for '(and (equal (alist-get (list "pointer-settings" (quote touchpad)) waymacs--sent-settings nil nil (function equal)) (list "tap=0" "natural-scroll=1")) (equal (alist-get (list "pointer-settings" (quote mouse)) waymacs--sent-settings nil nil (function equal)) (list "accel-profile=flat" "accel-speed=-0.5")) (waymacs--connected-p) t)'
+elisp '(customize-set-variable (quote waymacs-pointer-settings) nil)' > /dev/null
+
 name="menus of applications get the keyboard (GTK3)"
 if python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2> /dev/null; then
 	GDK_BACKEND=wayland python3 "$top/test/gtk-menu.py" > "$work/menu.txt" 2>&1 &
@@ -197,6 +239,23 @@ if python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2> /dev/null; then
 	done
 	check grep -q 'activated First item' "$work/menu.txt"
 	elisp '(kill-buffer (window-buffer))' > /dev/null
+else
+	echo "SKIP $name (python3-gi not installed)"
+fi
+
+name="a dialog of a Wayland window floats and gets the keyboard (GTK3)"
+if python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2> /dev/null; then
+	GDK_BACKEND=wayland python3 "$top/test/gtk-dialog.py" > "$work/dialog.txt" 2>&1 &
+	dialog_client=$!
+	buffer_titled() { echo "(cl-find \"$1\" (buffer-list) :key (lambda (buffer) (buffer-local-value (quote waymacs-title) buffer)) :test (function equal))"; }
+	wait_for "(and $(buffer_titled dialog-test-main) t)"
+	kill -USR1 "$dialog_client"
+	check wait_for "(let ((dialog $(buffer_titled dialog-test))) (and (buffer-local-value (quote waymacs--floating) dialog) (not (get-buffer-window dialog t)) (equal waymacs--last-focus (list (buffer-local-value (quote waymacs--id) dialog)))))"
+	name="a Wayland window that cannot be resized floats (GTK3)"
+	kill -USR2 "$dialog_client"
+	check wait_for "(and (buffer-local-value (quote waymacs--floating) $(buffer_titled fixed-size-test)) t)"
+	kill "$dialog_client"
+	wait_for "(null $(buffer_titled dialog-test-main))"
 else
 	echo "SKIP $name (python3-gi not installed)"
 fi
@@ -283,11 +342,11 @@ second_connection_refused() {
 import socket, sys
 connection = socket.socket(socket.AF_UNIX)
 connection.connect(sys.argv[1])
-connection.sendall(b"hello 1\n")
 connection.settimeout(3)
 try:
+    connection.sendall(b"hello 1\n")
     reply = connection.recv(100)
-except ConnectionResetError:
+except ConnectionError:  # closed before or after the hello: refused
     reply = b""
 sys.exit(0 if reply == b"" else 1)
 ' "$XDG_RUNTIME_DIR/waymacs-$WAYLAND_DISPLAY.sock"
@@ -356,6 +415,8 @@ name="the other monitor gets the first workspace assigned to it"
 check wait_for '(and (waymacs-workspace--frame 6) (frame-parameter (waymacs-workspace--frame 6) (quote waymacs-id)) t)'
 name="each monitor shows its own workspace"
 check [ "$(output_colors)" = "blue red" ]
+name="Emacs knows which monitor each workspace is on"
+check wait_for '(and (equal (frame-parameter (waymacs-workspace--frame 1) (quote waymacs-output)) "HEADLESS-1") (equal (frame-parameter (waymacs-workspace--frame 6) (quote waymacs-output)) "HEADLESS-2"))'
 name="a workspace is made on the monitor it is assigned to"
 elisp '(waymacs-workspace-switch 7)' > /dev/null
 sleep 1
@@ -379,6 +440,8 @@ elisp '(setq waymacs-internal-output-regexp "\\`HEADLESS-1")' > /dev/null
 name="closing the lid turns the laptop screen off"
 elisp "(waymacs--dispatch '(lid :closed t))" > /dev/null
 check wait_for '(equal (mapcar (function car) waymacs--outputs) (list "HEADLESS-2"))'
+name="Emacs is told where the laptop screen's workspaces went"
+check wait_for '(cl-every (lambda (frame) (equal (frame-parameter frame (quote waymacs-output)) "HEADLESS-2")) (waymacs-workspace-frames))'
 name="its workspace is shown on the other monitor"
 elisp '(waymacs-workspace-switch 3)' > /dev/null
 sleep 1
@@ -389,6 +452,41 @@ elisp "(waymacs--dispatch '(lid :closed nil))" > /dev/null
 check wait_for '(= (length waymacs--outputs) 2)'
 sleep 1
 check [ "$(output_colors)" = "green white" ]
+name="waymacs-output-settings places the monitors"
+elisp '(customize-set-variable (quote waymacs-output-settings) (quote (("HEADLESS-1" :position (0 . 0)) ("HEADLESS-2" :position (1280 . 0)))))' > /dev/null
+sleep 1
+check [ "$(output_colors)" = "white green" ]
+elisp '(kill-emacs)' > /dev/null
+wait "$compositor"
+
+# ---- three monitors: where workspaces are made, where they go ----
+export WAYMACS_TEST_SERVER="waymacs-smoke-three-$$"
+WLR_HEADLESS_OUTPUTS=3 \
+WAYMACS_TEST_SETUP="(setq waymacs-workspace-outputs '((\"HEADLESS-1\" 2)))" \
+	"$top/test/run-headless.sh" > "$work/three.log" 2>&1 &
+compositor=$!
+for _ in $(seq 1 100); do
+	grep -q 'Emacs connected' "$work/three.log" 2>/dev/null && break
+	sleep 0.1
+done
+WAYLAND_DISPLAY=$(sed -n 's/.*running on WAYLAND_DISPLAY=//p' "$work/three.log")
+# is workspace $1 on monitor $2?
+on_output() { echo "(equal (frame-parameter (waymacs-workspace--frame $1) (quote waymacs-output)) \"$2\")"; }
+name="each of three monitors gets a workspace"
+check wait_for "(and $(on_output 2 HEADLESS-1) (= 3 (length (delq nil (delete-dups (mapcar (lambda (frame) (frame-parameter frame (quote waymacs-output))) (waymacs-workspace-frames)))))))"
+name="a workspace assigned to no monitor is made on the focused one"
+elisp '(waymacs-workspace-switch 2)' > /dev/null
+wait_for '(eql (waymacs-workspace-current) 2)'
+elisp '(waymacs-workspace-switch 4)' > /dev/null
+check wait_for "$(on_output 4 HEADLESS-1)"
+name="a workspace whose monitor goes away goes to the one it belongs on"
+elisp '(waymacs--send "frame-output" (frame-parameter (waymacs-workspace--frame 2) (quote waymacs-id)) "HEADLESS-3")' > /dev/null
+wait_for "$(on_output 2 HEADLESS-3)"
+# HEADLESS-3 plays the laptop screen: closing the lid turns it off.  The
+# compositor moves its workspaces to HEADLESS-2, the first monitor it has
+# left; Emacs moves workspace 2 on to HEADLESS-1, where it belongs.
+elisp '(progn (setq waymacs-internal-output-regexp "\\`HEADLESS-3") (waymacs--dispatch (quote (lid :closed t))))' > /dev/null
+check wait_for "(and (null (assoc \"HEADLESS-3\" waymacs--outputs)) $(on_output 2 HEADLESS-1))"
 elisp '(kill-emacs)' > /dev/null
 wait "$compositor"
 

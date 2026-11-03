@@ -490,14 +490,99 @@ static void handle_cursor_button(void *data)
 	wlr_seat_pointer_notify_button(server.seat, event->time_msec, event->button, event->state);
 }
 
-/* libinput leaves tap-to-click off; most people want it on touchpads */
-static void configure_pointer(wlr_input_device *device)
+/* ---- pointing devices: waymacs-pointer-settings ---- */
+
+/* a touchpad, mouse, trackpoint... that libinput handles */
+struct Pointer {
+	explicit Pointer(wlr_input_device *device);
+	~Pointer();
+	void configure();
+
+	libinput_device *handle;
+	bool touchpad;		/* else a mouse or the like */
+	Listener destroy;
+};
+
+static std::vector<Pointer *> pointers;
+
+static const std::pair<const char *, libinput_config_accel_profile> accel_profiles[] = {
+	{ "adaptive", LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE },
+	{ "flat", LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT },
+};
+static const std::pair<const char *, libinput_config_click_method> click_methods[] = {
+	{ "button-areas", LIBINPUT_CONFIG_CLICK_METHOD_BUTTON_AREAS },
+	{ "clickfinger", LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER },
+};
+static const std::pair<const char *, libinput_config_scroll_method> scroll_methods[] = {
+	{ "none", LIBINPUT_CONFIG_SCROLL_NO_SCROLL },
+	{ "two-finger", LIBINPUT_CONFIG_SCROLL_2FG },
+	{ "edge", LIBINPUT_CONFIG_SCROLL_EDGE },
+	{ "on-button-down", LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN },
+};
+
+/* the value named NAME in VALUES, else OTHERWISE */
+template <typename Value, size_t N>
+static Value named(const char *name, const std::pair<const char *, Value> (&values)[N],
+		   Value otherwise)
 {
-	if (!wlr_input_device_is_libinput(device))
-		return;
-	libinput_device *libinput_device = wlr_libinput_get_device_handle(device);
-	if (libinput_device_config_tap_get_finger_count(libinput_device) > 0)
-		libinput_device_config_tap_set_enabled(libinput_device, LIBINPUT_CONFIG_TAP_ENABLED);
+	for (const auto &[value_name, value] : values)
+		if (name && !strcmp(name, value_name))
+			return value;
+	return otherwise;
+}
+
+Pointer::Pointer(wlr_input_device *device) : handle(wlr_libinput_get_device_handle(device))
+{
+	touchpad = libinput_device_config_tap_get_finger_count(handle) > 0;
+	destroy.listen(&device->events.destroy, [this](void *) { delete this; });
+	pointers.push_back(this);
+	configure();
+}
+
+Pointer::~Pointer()
+{
+	erase(pointers, this);
+}
+
+/* Set the device up as waymacs-pointer-settings say.  What they leave out
+ * is libinput's default, except that tapping a touchpad clicks: libinput
+ * leaves that off, most people want it.  A setting the device does not
+ * have is ignored (libinput refuses it). */
+void Pointer::configure()
+{
+	const Settings &settings = touchpad ? server.touchpad_settings : server.mouse_settings;
+	auto on = [&settings](const char *name, bool otherwise) {
+		const char *value = settings.get(name);
+		return value ? strcmp(value, "0") != 0 : otherwise;
+	};
+	libinput_device_config_tap_set_enabled(handle, on("tap", touchpad) ?
+		LIBINPUT_CONFIG_TAP_ENABLED : LIBINPUT_CONFIG_TAP_DISABLED);
+	libinput_device_config_scroll_set_natural_scroll_enabled(handle, on("natural-scroll",
+		libinput_device_config_scroll_get_default_natural_scroll_enabled(handle)));
+	libinput_device_config_dwt_set_enabled(handle, on("disable-while-typing",
+		libinput_device_config_dwt_get_default_enabled(handle) == LIBINPUT_CONFIG_DWT_ENABLED) ?
+		LIBINPUT_CONFIG_DWT_ENABLED : LIBINPUT_CONFIG_DWT_DISABLED);
+	libinput_device_config_left_handed_set(handle, on("left-handed",
+		libinput_device_config_left_handed_get_default(handle)));
+	libinput_device_config_middle_emulation_set_enabled(handle, on("middle-emulation",
+		libinput_device_config_middle_emulation_get_default_enabled(handle) ==
+		LIBINPUT_CONFIG_MIDDLE_EMULATION_ENABLED) ?
+		LIBINPUT_CONFIG_MIDDLE_EMULATION_ENABLED : LIBINPUT_CONFIG_MIDDLE_EMULATION_DISABLED);
+	const char *speed = settings.get("accel-speed");
+	libinput_device_config_accel_set_speed(handle, speed ? atof(speed) :
+		libinput_device_config_accel_get_default_speed(handle));
+	libinput_device_config_accel_set_profile(handle, named(settings.get("accel-profile"),
+		accel_profiles, libinput_device_config_accel_get_default_profile(handle)));
+	libinput_device_config_click_set_method(handle, named(settings.get("click-method"),
+		click_methods, libinput_device_config_click_get_default_method(handle)));
+	libinput_device_config_scroll_set_method(handle, named(settings.get("scroll-method"),
+		scroll_methods, libinput_device_config_scroll_get_default_method(handle)));
+}
+
+void pointers_reconfigure()
+{
+	for (Pointer *pointer : pointers)
+		pointer->configure();
 }
 
 /* ---- the laptop lid: Emacs decides what to do about it ---- */
@@ -531,7 +616,8 @@ static void handle_new_input(void *data)
 	if (device->type == WLR_INPUT_DEVICE_KEYBOARD) {
 		new Keyboard(wlr_keyboard_from_input_device(device), false);
 	} else if (device->type == WLR_INPUT_DEVICE_POINTER) {
-		configure_pointer(device);
+		if (wlr_input_device_is_libinput(device))
+			new Pointer(device);
 		wlr_cursor_attach_input_device(server.cursor, device);
 	} else if (device->type == WLR_INPUT_DEVICE_SWITCH) {
 		new LidSwitch(device);

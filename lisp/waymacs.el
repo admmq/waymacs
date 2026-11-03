@@ -57,6 +57,12 @@
   (when (fboundp 'waymacs-input--update-keys)
     (waymacs-input--update-keys)))
 
+(defun waymacs--set-and-send-settings (symbol value)
+  "Set SYMBOL to VALUE and send the new settings to the compositor."
+  (set-default-toplevel-value symbol value)
+  (when (fboundp 'waymacs--send-settings)
+    (waymacs--send-settings)))
+
 (defcustom waymacs-input-prefix-keys
   '(?\C-x ?\C-u ?\C-h ?\M-x ?\M-` ?\M-& ?\M-:)
   "Keys that go to Emacs while an application window in line mode has focus.
@@ -139,6 +145,61 @@ Terminals are good candidates too (app id \"foot\", \"kitty\"...)."
 nil keeps the compositor default (25 . 600)."
   :type '(choice (const nil) (cons integer integer)))
 
+(defcustom waymacs-output-settings nil
+  "How monitors are set up, as an alist (OUTPUT . SETTINGS).
+OUTPUT is a monitor name such as \"eDP-1\", `internal' for the built-in
+screen of a laptop, `external' for the other monitors (as in
+`waymacs-workspace-outputs') or t for any monitor; the first entry that
+matches a monitor applies.  SETTINGS is a plist:
+
+  :mode       \"WIDTHxHEIGHT\" or \"WIDTHxHEIGHT@RATE\", such as
+              \"2560x1440@144\"; by default the monitor's preferred mode
+  :scale      a number such as 1.5; by default $WAYMACS_SCALE, else 1
+  :position   (X . Y), its top left corner in the layout, where a
+              monitor takes its size divided by its scale; by default
+              the monitors are placed left to right
+  :transform  `normal', 90, 180, 270, `flipped', `flipped-90',
+              `flipped-180' or `flipped-270', as wlr-randr spells them
+
+For example, a laptop screen at twice the usual scale below a monitor:
+
+  \\='((internal :scale 2 :position (0 . 1440))
+    (\"DP-1\" :position (0 . 0)))"
+  :type '(alist :key-type (choice (const :tag "Built-in screen" internal)
+                                  (const :tag "Other monitors" external)
+                                  (const :tag "Any monitor" t)
+                                  (string :tag "Monitor name"))
+                :value-type (plist :key-type symbol :value-type sexp))
+  :initialize #'custom-initialize-default
+  :set #'waymacs--set-and-send-settings)
+
+(defcustom waymacs-pointer-settings nil
+  "How touchpads and mice behave, as an alist (DEVICE . SETTINGS).
+DEVICE is `touchpad', `mouse' (any other pointing device) or t for
+both; the first entry that matches a device applies.  SETTINGS is a
+plist:
+
+  :tap                   tapping the touchpad clicks
+  :natural-scroll        the content moves the way the fingers do
+  :disable-while-typing  the touchpad does nothing while typing
+  :left-handed           the buttons are swapped
+  :middle-emulation      both buttons at once are a middle click
+  :accel-speed           the pointer speed, from -1.0 to 1.0
+  :accel-profile         `adaptive', or `flat' for no acceleration
+  :click-method          `button-areas' or `clickfinger'
+  :scroll-method         `two-finger', `edge', `on-button-down' or `none'
+
+The first five are turned on with t and off with nil.  Settings left
+out are libinput's defaults, except that tapping is on.  For example:
+
+  \\='((touchpad :natural-scroll t :accel-speed 0.3)
+    (mouse :accel-profile flat))"
+  :type '(alist :key-type (choice (const touchpad) (const mouse)
+                                  (const :tag "Both" t))
+                :value-type (plist :key-type symbol :value-type sexp))
+  :initialize #'custom-initialize-default
+  :set #'waymacs--set-and-send-settings)
+
 (defcustom waymacs-buffer-name-function #'waymacs-buffer-name-default
   "Function returning the name of an application buffer.
 It is called in the buffer, where `waymacs-title' and `waymacs-app-id'
@@ -149,6 +210,26 @@ are set.  nil means never rename the buffer."
   "Function called with a buffer whose application asks to be activated.
 Applications do that through xdg-activation, e.g. a browser asked to
 open a link by another program."
+  :type 'function)
+
+(defcustom waymacs-floating-function #'waymacs-floating-default
+  "Function deciding whether a new application window floats.
+It is called in the window's buffer, where `waymacs-app-id' and
+`waymacs-title' are set, with a plist describing the window:
+
+  :parent      non-nil if it is a dialog of another window
+  :modal       non-nil if it is a modal dialog (X11 windows only)
+  :fixed-size  non-nil if it cannot be resized
+  :type        its X11 window type if that is one of `dialog',
+               `utility', `toolbar' and `splash', else nil
+
+A non-nil value makes the window float; nil gives it an Emacs window.
+For example, to float pavucontrol as well:
+
+  (setq waymacs-floating-function
+        (lambda (properties)
+          (or (equal waymacs-app-id \"pavucontrol\")
+              (waymacs-floating-default properties))))"
   :type 'function)
 
 (defcustom waymacs-manage-finish-hook nil
@@ -275,6 +356,9 @@ go back.  The screen is the one `waymacs-internal-output-regexp' matches."
 (defvar waymacs--sync-timer nil
   "Timer for a focus update postponed by pending input.")
 
+(defvar waymacs--sent-settings nil
+  "Settings sent to the compositor, an alist ((COMMAND TARGET) . WORDS).")
+
 (defvar-local waymacs--id nil
   "Id of the application window of this buffer.")
 
@@ -353,7 +437,8 @@ there would otherwise connect and take over the window management."
         waymacs--last-minibuffer nil
         waymacs--last-workspaces nil
         waymacs--last-layout nil
-        waymacs--last-focus nil)
+        waymacs--last-focus nil
+        waymacs--sent-settings nil)
   (setq waymacs--process
         (make-network-process :name "waymacs" :family 'local
                               :service waymacs--socket
@@ -458,6 +543,12 @@ workspace, as a taskbar click does in other window managers."
            (select-window window)))
         (t (pop-to-buffer buffer))))
 
+(defun waymacs-floating-default (properties)
+  "Float dialogs and windows that cannot be resized.
+PROPERTIES describes the window, see `waymacs-floating-function'."
+  (or (plist-get properties :parent) (plist-get properties :modal)
+      (plist-get properties :fixed-size) (plist-get properties :type)))
+
 ;;; Events from the compositor
 
 (defun waymacs--dispatch (event)
@@ -473,6 +564,7 @@ workspace, as a taskbar click does in other window managers."
        (when-let* ((buffer (waymacs--buffer (plist-get properties :id))))
          (funcall waymacs-activate-function buffer)))
       ('frame (waymacs--on-frame properties))
+      ('frame-placed (waymacs--on-frame-placed properties))
       ('need-frame (waymacs--make-output-frame (plist-get properties :output)))
       ;; clicks in a status bar
       ('workspace-switch (waymacs-workspace-switch (plist-get properties :number)))
@@ -481,9 +573,7 @@ workspace, as a taskbar click does in other window managers."
             (force-mode-line-update t))
       ('output (waymacs--on-output properties)
                (waymacs--update-lid))
-      ('output-removed
-       (setq waymacs--outputs (assoc-delete-all (plist-get properties :name) waymacs--outputs))
-       (waymacs--update-lid))
+      ('output-removed (waymacs--on-output-removed properties))
       ('output-off (cl-pushnew (plist-get properties :name) waymacs--outputs-off
                                :test #'equal))
       ('lid (setq waymacs--lid-closed (plist-get properties :closed))
@@ -511,8 +601,17 @@ A monitor just connected gets the workspaces that belong there."
   (let* ((name (plist-get event :name))
          (new (not (assoc name waymacs--outputs))))
     (setf (alist-get name waymacs--outputs nil nil #'equal) event)
+    (waymacs--send-settings)
     (when (and new waymacs-workspace-outputs)
       (mapc #'waymacs-workspace--place (waymacs-workspace-frames)))))
+
+(defun waymacs--on-output-removed (event)
+  "Forget the monitor in EVENT, unplugged or turned off.
+The compositor moved its workspaces to another monitor; those that
+belong on a monitor still there (`waymacs-workspace-outputs') go to it."
+  (setq waymacs--outputs (assoc-delete-all (plist-get event :name) waymacs--outputs))
+  (waymacs--update-lid)
+  (mapc #'waymacs-workspace--place (waymacs-workspace-frames)))
 
 (defun waymacs--on-new (event)
   "Make a buffer for the application window described by EVENT, a plist."
@@ -534,11 +633,27 @@ A monitor just connected gets the workspaces that belong there."
         (when (cl-some (lambda (regexp) (string-match-p regexp (or waymacs-app-id "")))
                        waymacs-input-char-mode-apps)
           (waymacs-input--set-char-mode t))
+        (waymacs--decide-floating event)
         (run-hooks 'waymacs-manage-finish-hook)))
     (unless (or old (buffer-local-value 'waymacs--floating buffer))
       (if (active-minibuffer-window)
           (push buffer waymacs--pending-display)
         (waymacs--display-new buffer)))))
+
+(defun waymacs--decide-floating (event)
+  "Decide with `waymacs-floating-function' whether the new window floats.
+EVENT is the compositor's description of the current buffer's window,
+which already floats if it appeared while no Emacs was connected.  A
+window made to float gets the focus, as new windows do."
+  (let ((floating (and (with-demoted-errors "waymacs-floating-function: %S"
+                         (funcall waymacs-floating-function event))
+                       t)))
+    (unless (eq floating (and waymacs--floating t))
+      (setq waymacs--floating floating)
+      (waymacs--send "float" waymacs--id (if floating 1 0))
+      (when floating
+        (setq waymacs--floating-focus waymacs--id
+              waymacs--last-window (selected-window))))))
 
 (defun waymacs--display-new (buffer)
   "Show and select BUFFER, a new application window.
@@ -617,7 +732,8 @@ that one stays in view and BUFFER goes in another window."
        (not (frame-parameter frame 'parent-frame))))
 
 (defun waymacs--tag-frame (frame)
-  "Title FRAME with a unique tag so the compositor can name it."
+  "Title FRAME with a unique tag so the compositor can name it.
+Frames made by `waymacs--make-frame' have theirs from the start."
   (when (and (waymacs--frame-p frame)
              (not (frame-parameter frame 'waymacs-tag)))
     (set-frame-parameter frame 'waymacs-tag
@@ -632,13 +748,22 @@ that one stays in view and BUFFER goes in another window."
     (unless waymacs--making-background-frame
       (select-frame frame))))
 
+(defun waymacs--frame-title (tag number output)
+  "The title of a new frame tagged TAG, for workspace NUMBER.
+It is \"TAG@MONITOR\", and the compositor shows the frame on MONITOR from
+the start: OUTPUT if non-nil, else the monitor workspace NUMBER belongs
+on (`waymacs-workspace-outputs'), else the focused one."
+  (let ((output (or output (waymacs-workspace--output number)
+                    (frame-parameter (selected-frame) 'waymacs-output))))
+    (concat tag (and output (concat "@" output)))))
+
 (defun waymacs--title-frame (frame)
   "Title FRAME, not yet known to the compositor, with its tag.
-The title is \"TAG@OUTPUT\" when its workspace belongs on monitor OUTPUT:
-the compositor then shows it there from the start."
-  (let ((output (waymacs-workspace--output (frame-parameter frame 'waymacs-workspace))))
-    (set-frame-parameter frame 'title (concat (frame-parameter frame 'waymacs-tag)
-                                              (and output (concat "@" output))))))
+See `waymacs--frame-title'."
+  (set-frame-parameter frame 'title
+                       (waymacs--frame-title (frame-parameter frame 'waymacs-tag)
+                                             (frame-parameter frame 'waymacs-workspace)
+                                             (frame-parameter frame 'waymacs-output))))
 
 (defun waymacs--on-frame (event)
   "Remember the compositor id of the frame tagged as said in EVENT."
@@ -646,6 +771,7 @@ the compositor then shows it there from the start."
     (when (equal (frame-parameter frame 'waymacs-tag) (plist-get event :tag))
       (let ((id (plist-get event :id)))
         (set-frame-parameter frame 'waymacs-id id)
+        (set-frame-parameter frame 'waymacs-output (plist-get event :output))
         (set-frame-parameter frame 'title nil)
         (waymacs-workspace--place frame)
         ;; floating windows moved here before the frame was ever shown
@@ -653,13 +779,25 @@ the compositor then shows it there from the start."
           (waymacs--send "assign" app-id id))
         (set-frame-parameter frame 'waymacs-pending-floating nil)))))
 
-(defun waymacs--make-frame (parameters &optional background)
+(defun waymacs--on-frame-placed (event)
+  "Record the monitor that the frame in EVENT is on now."
+  (when-let* ((frame (cl-find (plist-get event :id) (frame-list)
+                              :key (lambda (frame) (frame-parameter frame 'waymacs-id)))))
+    (set-frame-parameter frame 'waymacs-output (plist-get event :output))))
+
+(defun waymacs--make-frame (parameters)
   "Make a frame with PARAMETERS showing `waymacs-workspace-initial-buffer'.
-With BACKGROUND, do not select it."
-  (let ((waymacs--making-background-frame background)
-        (graphical-frame (if (waymacs--frame-p (selected-frame))
-                             (selected-frame)
-                           (cl-find-if #'waymacs--frame-p (frame-list)))))
+It is not selected.  It is titled with its tag from the start (see
+`waymacs--frame-title'), so that it appears on the right monitor."
+  (let* ((graphical-frame (if (waymacs--frame-p (selected-frame))
+                              (selected-frame)
+                            (cl-find-if #'waymacs--frame-p (frame-list))))
+         (tag (format "waymacs-frame-%d" (cl-incf waymacs--frame-counter)))
+         (parameters `((waymacs-tag . ,tag)
+                       (title . ,(waymacs--frame-title
+                                  tag (alist-get 'waymacs-workspace parameters)
+                                  (alist-get 'waymacs-output parameters)))
+                       ,@parameters)))
     (if graphical-frame
         (with-selected-frame graphical-frame
           ;; A new frame shows the current buffer, which must not be an
@@ -679,10 +817,11 @@ a number that belongs on no monitor."
   (let* ((numbers (waymacs-workspace--numbers-on output))
          (frames (delq nil (mapcar #'waymacs-workspace--frame numbers))))
     (cond (frames (mapc #'waymacs-workspace--place frames))
-          (numbers (waymacs--make-frame `((waymacs-workspace . ,(car numbers))) t))
+          (numbers (waymacs--make-frame `((waymacs-workspace . ,(car numbers))
+                                          (waymacs-output . ,output))))
           (t (waymacs--make-frame
-              `((waymacs-workspace . ,(waymacs-workspace--free-number t)))
-              t)))))
+              `((waymacs-workspace . ,(waymacs-workspace--free-number t))
+                (waymacs-output . ,output)))))))
 
 (defun waymacs--after-select-frame (frame &rest _)
   "Show FRAME, after `select-frame-set-input-focus' selected it."
@@ -1100,14 +1239,14 @@ A frame the compositor does not know yet is placed when it learns about
 it (the `frame' event)."
   (when-let* ((id (frame-parameter frame 'waymacs-id))
               (number (frame-parameter frame 'waymacs-workspace))
-              (output (waymacs-workspace--output number)))
+              (output (waymacs-workspace--output number))
+              ((not (equal output (frame-parameter frame 'waymacs-output)))))
     (waymacs--send "frame-place" id output)))
 
 (defun waymacs-workspace--make (number &optional background)
   "Make workspace NUMBER; with BACKGROUND, make it without showing it."
   (waymacs--make-frame `((waymacs-workspace . ,number)
-                         ,@(and background '((visibility . nil))))
-                       background))
+                         ,@(and background '((visibility . nil))))))
 
 (defun waymacs-workspace-switch (number)
   "Show workspace NUMBER, making it on the focused monitor if needed.
@@ -1223,6 +1362,40 @@ The workspace is made if needed, without showing it.  See also
   (when waymacs-keyboard-repeat
     (waymacs--send "repeat" (car waymacs-keyboard-repeat) (cdr waymacs-keyboard-repeat))))
 
+(defun waymacs--settings-words (settings)
+  "SETTINGS, a plist, as the compositor's NAME=VALUE words."
+  (cl-loop for (key value) on settings by #'cddr
+           collect (format "%s=%s" (string-remove-prefix ":" (symbol-name key))
+                           (pcase value
+                             ('t 1)
+                             ('nil 0)
+                             (`(,x . ,y) (format "%s,%s" x y))
+                             (_ value)))))
+
+(defun waymacs--send-settings-of (command target settings)
+  "Send COMMAND for TARGET with SETTINGS, a plist, unless sent already."
+  (let ((key (list command target))
+        (words (waymacs--settings-words settings)))
+    (unless (equal words (alist-get key waymacs--sent-settings 'unsent nil #'equal))
+      (setf (alist-get key waymacs--sent-settings nil nil #'equal) words)
+      (waymacs--send command target words))))
+
+(defun waymacs--send-settings ()
+  "Send `waymacs-output-settings' and `waymacs-pointer-settings' that changed."
+  (dolist (output waymacs--outputs)
+    (let ((name (car output)))
+      (waymacs--send-settings-of
+       "output-settings" name
+       (cdr (cl-find-if (lambda (entry)
+                          (or (eq (car entry) t)
+                              (waymacs--output-matches-p (car entry) name)))
+                        waymacs-output-settings)))))
+  (dolist (device '(touchpad mouse))
+    (waymacs--send-settings-of
+     "pointer-settings" device
+     (cdr (cl-find-if (lambda (entry) (memq (car entry) (list t device)))
+                      waymacs-pointer-settings)))))
+
 (defun waymacs--init ()
   "Connect to the compositor and start managing windows."
   (cond
@@ -1237,6 +1410,8 @@ The workspace is made if needed, without showing it.  See also
     (waymacs--connect)
     (waymacs-input--update-keys)
     (waymacs--configure-keyboard)
+    ;; the pointer settings; a monitor's go once it is announced
+    (waymacs--send-settings)
     (add-hook 'post-command-hook #'waymacs--post-command)
     (add-hook 'window-state-change-hook #'waymacs--sync)
     (add-hook 'minibuffer-setup-hook #'waymacs--sync)
