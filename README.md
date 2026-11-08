@@ -89,8 +89,9 @@ in your init file, in `with-eval-after-load`:
 ## How to debug with gdb
 
 ```bash
+guix shell -D -f package.scm gdb
+
 make clean debug
 
-env -u EMACSLOADPATH -u EMACSNATIVELOADPATH \
-  gdb --args ./waymacs -d -- emacs-pgtk -Q -l test/init.el -l lisp/waymacs.el -f waymacs-enable
+gdb --args ./waymacs -d -- emacs -Q -l test/init.el -l lisp/waymacs.el -f waymacs-enable
 ```

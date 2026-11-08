@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later (see COPYING)
 PREFIX ?= /usr/local
 PKG_CONFIG ?= pkg-config
+# make's built-in default is cc, which some systems (Guix) lack
+ifeq ($(origin CC),default)
+CC = gcc
+endif
 EMACS ?= emacs
 # where the session file tells Emacs to load waymacs.el from
 LISPDIR ?= $(CURDIR)/lisp
