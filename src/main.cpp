@@ -186,6 +186,7 @@ int main(int argc, char **argv)
 	input_init();
 	lock_init();	/* its scene tree goes above everything */
 	bar_init();
+	nested_init();	/* in a window of another desktop: before it opens */
 
 	const char *socket_name = wl_display_add_socket_auto(server.display);
 	if (!socket_name) {

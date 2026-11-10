@@ -86,6 +86,10 @@ in your init file, in `with-eval-after-load`:
 
 `M-x customize-group RET waymacs` lists all the settings.
 
+In a window of a Wayland desktop (`test/run-nested.sh`), waymacs asks the
+desktop to pass its own shortcuts (Super+1, Alt+Tab...) on while the window
+has the keyboard.  GNOME asks you first; Super+Escape gives them back to it.
+
 ## How to debug with gdb
 
 ```bash

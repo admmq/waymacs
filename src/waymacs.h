@@ -399,6 +399,9 @@ bool is_lock_surface(wlr_surface *surface);
 void xwayland_init();
 void xwayland_finish();
 
+/* nested.cpp */
+void nested_init();
+
 /* output.cpp */
 void output_init();
 void outputs_announce();

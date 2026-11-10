@@ -11,7 +11,7 @@ EMACS ?= emacs
 LISPDIR ?= $(CURDIR)/lisp
 # wlroots 0.19 or 0.18, whichever is installed (0.19 if both are)
 WLROOTS ?= $(shell $(PKG_CONFIG) --exists wlroots-0.19 && echo wlroots-0.19 || echo wlroots-0.18)
-PKGS = $(WLROOTS) wayland-server xkbcommon libinput pixman-1 xcb
+PKGS = $(WLROOTS) wayland-server wayland-client xkbcommon libinput pixman-1 xcb
 
 WAYLAND_PROTOCOLS := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)
 WAYLAND_SCANNER := $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scanner)
@@ -25,16 +25,20 @@ WAYMACS_CXXFLAGS = -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra \
 LDLIBS += $(shell $(PKG_CONFIG) --libs $(PKGS))
 
 SRC = src/main.cpp src/ipc.cpp src/view.cpp src/input.cpp src/output.cpp src/lock.cpp \
-	src/bar.cpp src/xwayland.cpp
+	src/bar.cpp src/xwayland.cpp src/nested.cpp
 # protocols waymacs implements itself (wlroots does not): their code too
 OWN_PROTOCOLS = river-status-unstable-v1 river-control-unstable-v1
-OBJ = $(SRC:src/%.cpp=build/%.o) $(OWN_PROTOCOLS:%=build/%-protocol.o)
+# used as a client of the desktop waymacs runs nested in
+HOST_PROTOCOL = keyboard-shortcuts-inhibit-unstable-v1
+OBJ = $(SRC:src/%.cpp=build/%.o) $(OWN_PROTOCOLS:%=build/%-protocol.o) \
+	build/$(HOST_PROTOCOL)-protocol.o
 # protocol headers that the wlroots headers include, and our own
 PROTO = build/xdg-shell-protocol.h \
 	build/wlr-layer-shell-unstable-v1-protocol.h \
 	build/cursor-shape-v1-protocol.h \
 	build/tablet-v2-protocol.h \
-	$(OWN_PROTOCOLS:%=build/%-protocol.h)
+	$(OWN_PROTOCOLS:%=build/%-protocol.h) \
+	build/$(HOST_PROTOCOL)-client-protocol.h
 
 all: waymacs
 
@@ -57,6 +61,12 @@ build/cursor-shape-v1-protocol.h:
 build/tablet-v2-protocol.h:
 	@mkdir -p build
 	$(WAYLAND_SCANNER) server-header $(WAYLAND_PROTOCOLS)/unstable/tablet/tablet-unstable-v2.xml $@
+build/$(HOST_PROTOCOL)-client-protocol.h:
+	@mkdir -p build
+	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS)/unstable/keyboard-shortcuts-inhibit/$(HOST_PROTOCOL).xml $@
+build/$(HOST_PROTOCOL)-protocol.c:
+	@mkdir -p build
+	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS)/unstable/keyboard-shortcuts-inhibit/$(HOST_PROTOCOL).xml $@
 # protocol XML kept in protocols/
 build/%-protocol.h: protocols/%.xml
 	@mkdir -p build
